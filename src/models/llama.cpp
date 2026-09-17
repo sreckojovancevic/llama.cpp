@@ -77,9 +77,40 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
             layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
         } else {
             layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, 0);
-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
-            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
+
+            // Probe the merged MoE representation first. Some GGUFs (e.g. Mixtral)
+            // store each expert as separate tensors instead.
+            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i),
+                                                {n_embd, n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i),
+                                                {n_ff, n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i),
+                                                {n_embd, n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+
+            // Native split-expert representation.
+            if (layer.ffn_gate_exps == nullptr &&
+                layer.ffn_down_exps == nullptr &&
+                layer.ffn_up_exps == nullptr) {
+                layer.ffn_gate_exp.resize(n_expert);
+                layer.ffn_up_exp.resize(n_expert);
+                layer.ffn_down_exp.resize(n_expert);
+
+                for (int e = 0; e < n_expert; ++e) {
+                    layer.ffn_gate_exp[e] =
+                        create_tensor(tn(LLM_TENSOR_FFN_GATE_EXP, "weight", i, e),
+                                      {n_embd, n_ff}, 0);
+                    layer.ffn_up_exp[e] =
+                        create_tensor(tn(LLM_TENSOR_FFN_UP_EXP, "weight", i, e),
+                                      {n_embd, n_ff}, 0);
+                    layer.ffn_down_exp[e] =
+                        create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXP, "weight", i, e),
+                                      {n_ff, n_embd}, 0);
+                }
+            } else {
+                GGML_ASSERT(layer.ffn_gate_exps != nullptr);
+                GGML_ASSERT(layer.ffn_down_exps != nullptr);
+                GGML_ASSERT(layer.ffn_up_exps != nullptr);
+            }
 
             // For Granite MoE Shared
             if (hparams.n_ff_shexp > 0) {
