@@ -633,6 +633,9 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    if (ggml_mul_mat_id_get_skip(op) && device->iface.get_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
     return device->iface.supports_op(device, op);
 }
 
@@ -643,6 +646,9 @@ bool ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buff
 
 bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    if (ggml_mul_mat_id_get_skip(op) && device->iface.get_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
     if (device->iface.offload_op != NULL) {
         return device->iface.offload_op(device, op);
     }

@@ -4448,6 +4448,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * ne12 + (i1)]
 
+        const bool skip = ggml_mul_mat_id_get_skip(dst);
+
+        if (skip) {
+            for (int64_t i = ith; i < ids->ne[1] * n_ids; i += nth) {
+                const int64_t iid1 = i / n_ids;
+                const int     id   = i % n_ids;
+                const int32_t i02  = *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+                if (i02 < 0) {
+                    memset((char *) dst->data + id * nb1 + iid1 * nb2, 0, ne0 * sizeof(float));
+                }
+            }
+        }
+
         if (ith == 0) {
             // initialize matrix_row_counts
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
@@ -4457,6 +4470,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 for (int32_t id = 0; id < n_ids; ++id) {
                     const int32_t i02 =
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+
+                    if (skip && i02 < 0) {
+                        continue;
+                    }
 
                     GGML_ASSERT(i02 >= 0 && i02 < n_as);
 

@@ -160,6 +160,10 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
     return ((const float *)(tensor->op_params))[i];
 }
 
+static bool ggml_mul_mat_id_get_skip(const struct ggml_tensor * tensor) {
+    return tensor->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(tensor, 4) != 0;
+}
+
 // [TAG_GGML_PREC]
 // - GGML_OP_MUL_MAT
 //   0 - acc
@@ -172,6 +176,7 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
 //   1 - hint
 //   2 - src0 precision
 //   3 - src1 precision
+//   4 - skip ids < 0 (ggml_mul_mat_id_set_skip)
 static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int32_t value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     ((int32_t *)(tensor->op_params))[i] = value;

@@ -1503,6 +1503,12 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // skip = true: an id < 0 skips that slot and its dst row is set to 0
+    // only the CPU backend supports it, other devices reject such nodes
+    GGML_API void ggml_mul_mat_id_set_skip(
+            struct ggml_tensor * a,
+            bool                 skip);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

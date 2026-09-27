@@ -1594,6 +1594,9 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 }
                 break;
             case GGML_OP_MUL_MAT_ID:
+                if (ggml_mul_mat_id_get_skip(op)) {
+                    return false;
+                }
                 if (op->src[0]->buffer && (ggml_n_dims(op->src[0]) == 3) &&
                     op->src[0]->buffer->buft == ggml_backend_cpu_riscv64_spacemit_buffer_type() &&
                     ggml_riscv64_spacemit_get_optimal_repack_type(op->src[0])) {

@@ -5111,6 +5111,37 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID with ggml_mul_mat_id_set_skip: row 0 and every 3rd id are -1
+struct test_mul_mat_id_skip : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",skip=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_mul_mat_id_set_skip(out, true);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+
+        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+        std::vector<int32_t> data(ggml_nelements(ids));
+        ggml_backend_tensor_get(ids, data.data(), 0, ggml_nbytes(ids));
+        for (int64_t r = 0; r < ids->ne[1]; r++) {
+            for (int64_t i = 0; i < n_used; i++) {
+                if (r == 0 || (r*n_used + i) % 3 == 0) {
+                    data[r*ids->ne[0] + i] = -1;
+                }
+            }
+        }
+        ggml_backend_tensor_set(ids, data.data(), 0, ggml_nbytes(ids));
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -9937,6 +9968,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // experts that receive no rows at all
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
+    }
+
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (int n : {1, 4, 33}) {
+            test_cases.emplace_back(new test_mul_mat_id_skip(type_a, GGML_TYPE_F32, 8, 4, false, 256, n, 256));
+        }
     }
 
     for (ggml_type type_a : other_types) {

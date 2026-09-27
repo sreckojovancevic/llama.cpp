@@ -3415,6 +3415,14 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_skip(
+        struct ggml_tensor * a,
+        bool                 skip) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+
+    ggml_set_op_params_i32(a, 4, skip ? 1 : 0);
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
