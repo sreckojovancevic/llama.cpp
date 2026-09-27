@@ -839,6 +839,10 @@ struct ggml_backend_sched {
 
     int debug;
 
+    // GGML_SCHED_TIMING: 1 = one line per graph compute with time per backend, 2 = also one line per split
+    // the split backend is synchronized after each split, so async overlap between splits is lost
+    int timing;
+
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
     int debug_realloc;
@@ -1656,10 +1660,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // GGML_SCHED_TIMING
+    struct timing_acc { int n = 0; int64_t copy_us = 0; int64_t compute_us = 0; size_t copy_bytes = 0; };
+    std::vector<timing_acc> tacc(sched->timing ? sched->n_backends : 0);
+    const int64_t t_graph0 = sched->timing ? ggml_time_us() : 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        const int64_t t_split0 = sched->timing ? ggml_time_us() : 0;
+        size_t split_copy_bytes = 0;
+        if (sched->timing) {
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                split_copy_bytes += ggml_nbytes(split->inputs[input_id]);
+            }
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1798,6 +1815,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->timing) {
+            ggml_backend_synchronize(split_backend);
+        }
+        const int64_t t_split1 = sched->timing ? ggml_time_us() : 0;
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1837,12 +1859,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->timing) {
+            ggml_backend_synchronize(split_backend);
+            const int64_t t_split2 = ggml_time_us();
+            timing_acc & a = tacc[split_backend_id];
+            a.n++;
+            a.copy_us    += t_split1 - t_split0;
+            a.compute_us += t_split2 - t_split1;
+            a.copy_bytes += split_copy_bytes;
+            if (sched->timing >= 2) {
+                // first node with a name set by the user (e.g. "ffn_moe_up-12"), not an automatic "node_N"
+                const char * first = split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "-";
+                for (int j = 0; j < split->graph.n_nodes; j++) {
+                    const char * name = split->graph.nodes[j]->name;
+                    if (name[0] != '\0' && strncmp(name, "node_", 5) != 0) {
+                        first = name;
+                        break;
+                    }
+                }
+                fprintf(stderr, "sched_timing: split %3d %-12s nodes %4d first %-24s copy %7.1f us (%8zu B) compute %8.1f us\n",
+                        split_id, ggml_backend_name(split_backend), split->graph.n_nodes, first,
+                        (double) (t_split1 - t_split0), split_copy_bytes, (double) (t_split2 - t_split1));
+            }
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (sched->timing) {
+        fprintf(stderr, "sched_timing: graph %.3f ms, %d splits", (ggml_time_us() - t_graph0)/1000.0, sched->n_splits);
+        for (int b = 0; b < sched->n_backends; b++) {
+            const timing_acc & a = tacc[b];
+            if (a.n > 0) {
+                fprintf(stderr, " | %s: %d splits, compute %.3f ms, copy+sync %.3f ms, %.1f KiB in",
+                        ggml_backend_name(sched->backends[b]), a.n, a.compute_us/1000.0, a.copy_us/1000.0, a.copy_bytes/1024.0);
+            }
+        }
+        fprintf(stderr, "\n");
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1863,6 +1921,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+
+    const char * GGML_SCHED_TIMING = getenv("GGML_SCHED_TIMING");
+    sched->timing = GGML_SCHED_TIMING ? atoi(GGML_SCHED_TIMING) : 0;
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
