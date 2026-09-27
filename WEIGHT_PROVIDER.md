@@ -371,6 +371,51 @@ Not verified (needs the GPU machine):
 - Speed of the mapped cold bucket (plain kernels) against the copied one (CPU_REPACK).
 - MSVC build of `common/moe-placement.cpp` (uses `GlobalMemoryStatusEx`).
 
+## Task 5 - several hot devices (--moe-devices) [EXPERIMENTAL, not tested on real multi-GPU]
+
+Opt-in; without `--moe-devices` nothing changes (one hot bucket per layer, on the layer device if it is a GPU, else on the first GPU).
+
+- `--moe-devices <dev1,dev2,..>` (names as in `--list-devices`, e.g. `CUDA0,CUDA1` or `CUDA0,RPC0`), only with a ranking file. The devices must be used by the model (`-dev`, `--rpc`).
+- Budget per listed device, the same way as Task 4, from that device's share of the dry run: `free - (model share - probe experts) - KV share - compute - margin`. The probe puts expert number s (by count) of every layer on device s, so every device's compute buffer is measured with its bucket in the graph.
+- `--moe-vram-margin` takes one value for all devices or one per listed device (`1G,512M`).
+- Fill: devices in the listed order, each greedily with the hottest unassigned experts (count per byte); the rest goes to the CPU cold bucket (and the RAM tier with `--moe-ram-pin`) as before.
+- API: `llama_model_params::moe_devices` (NULL-terminated) and `moe_hot_dev` (device index of each hot pair).
+- Report: one budget line and one tier row per device (`VRAM CUDA0`, `VRAM CUDA1`, ...); the loader adds (with `-v`) one line per device with experts and MiB.
+
+Graph: a layer has one hot bucket per device that holds some of its experts, plus the cold bucket. `llama_layer_moe_placement` is now a list of buckets and one bucket table:
+
+1. For each bucket b: `ids_b = get_rows(ids_table_b, ids_flat)`. Hot buckets (not flagged) map the other experts to local 0 and use one slot per row (ids `[1, K*T]`, input repeated), as in Task 3; the cold bucket is flagged and uses `[K, T]` with -1 for the other experts.
+2. Each bucket output `[n_embd, K, T]` is reshaped to `[n_embd, 1, K*T]` and concatenated: `stacked [n_embd, N, K*T]`.
+3. `bucket = get_rows(bucket_table, ids_flat)` (0..N-1), `experts = get_rows(stacked, bucket)`, then the unchanged weighting and sum. A layer with one bucket skips 3.
+
+Placement of the id tables: each hot bucket's table on its device; the cold id table and the bucket table on the layer device when it is a GPU (else the first hot device). The hot bucket on the layer device comes first in the graph. With one device this is the same as before.
+
+Graph splits, two RPC servers as stand-in GPUs (tiny model, 4 MoE layers; layers 0-2 on RPC0, layer 3 and the output on RPC1; same counts at `-ub 512` and `-ub 1`):
+
+| run | splits |
+|---|---|
+| no override (all on the devices) | 3 |
+| `--cpu-moe` | 10 |
+| ranking, one hot device (default), everything fits | 3 |
+| `--moe-devices RPC0,RPC1`, everything fits on RPC0 | 5 |
+| `--moe-devices RPC1,RPC0`, both partial + cold, first version | 23 |
+| same, tables on the layer device and its bucket first (now) | 19 |
+
+Per layer with three buckets (layer on RPC0): RPC0 [attention, router, id lookups, RPC0 bucket] -> RPC1 [RPC1 bucket] -> CPU [cold bucket] -> RPC0 [combine, next layer], about 4 splits per layer against 2 for `--cpu-moe`. Every extra hot device of a layer adds one round trip, and the splits run one after the other (no overlap between devices).
+
+Verification (two local `ggml-rpc-server`s, `-nr` so all runs use the same kernels):
+
+- Logits exact (0) against `--cpu-moe`, at `-ub 512` and `-ub 1` (margins set per ubatch size so that both devices are partial): RPC1 + RPC0 + cold (e.g. 6 / 10 / 48 experts at `-ub 512`, 16 / 23 / 25 at `-ub 1`), the same with `--moe-ram-pin 1M`, everything on one listed device.
+- 48-layer model (from `regress-placement.py`), three buckets per layer (355 / 340 / 73 experts): exact; graph 3822 nodes of 11460 allowed.
+- Without `--moe-devices`: `regress-placement.py` on CPU and on one RPC device OK; single-RPC split counts unchanged (10 mixed, 2 all hot); the older CPU logits checks unchanged.
+- The budget depends on the ubatch size (compute buffers), so a margin tuned at one `-ub` gives another fill at another `-ub`. That is expected.
+
+Not verified: real multi-GPU (CUDA0 + CUDA1, or CUDA + a remote RPC GPU), speed, PCIe/network cost of the extra round trips.
+
+## Graph size fix (crash on 48 layers)
+
+A hot-set placement crashed on Qwen3-30B-A3B (48 MoE layers, CUDA) with `GGML_ASSERT(obj_new)`. Cause: the graph size limit is `8 x n_tensors`; with the placement the merged expert tensors were not counted any more, the placement tensors were not counted either, and each layer has more graph nodes. On the 4-layer test model the minimum of 1024 nodes hid it; on a 48-layer tiny model it reproduces as a hash set abort at graph reserve (the assert on the real model is the graph metadata buffer, sized from the same limit, while building the graph - not the loader's contexts, whose size does not change with the placement). Fix (commit "count placement tensors and nodes in the graph size"): the placement tensors are added to the model's tensor list, and `llama_model::n_moe_placement_nodes()` adds headroom per layer and bucket to `graph_max_nodes`. Regression check: `tools/expert-trace/regress-placement.py` (48 layers, hot-set and ranking, exact logits; `-- --rpc host:port -ngl 99` for a device); it fails without the fix and passes with it.
+
 ## Coding rules
 
 - Minimal diffs in core files; prefer new files under `tools/`.
