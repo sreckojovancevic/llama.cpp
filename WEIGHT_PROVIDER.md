@@ -424,6 +424,53 @@ Not verified: real multi-GPU (CUDA0 + CUDA1, or CUDA + a remote RPC GPU), speed,
 
 A hot-set placement crashed on Qwen3-30B-A3B (48 MoE layers, CUDA) with `GGML_ASSERT(obj_new)`. Cause: the graph size limit is `8 x n_tensors`; with the placement the merged expert tensors were not counted any more, the placement tensors were not counted either, and each layer has more graph nodes. On the 4-layer test model the minimum of 1024 nodes hid it; on a 48-layer tiny model it reproduces as a hash set abort at graph reserve (the assert on the real model is the graph metadata buffer, sized from the same limit, while building the graph - not the loader's contexts, whose size does not change with the placement). Fix (commit "count placement tensors and nodes in the graph size"): the placement tensors are added to the model's tensor list, and `llama_model::n_moe_placement_nodes()` adds headroom per layer and bucket to `graph_max_nodes`. Regression check: `tools/expert-trace/regress-placement.py` (48 layers, hot-set and ranking, exact logits; `-- --rpc host:port -ngl 99` for a device); it fails without the fix and passes with it.
 
+## Task 6 - follow-up to the first measurements (prefill, decode profile, KLD)
+
+Owner results (Qwen3-30B-A3B Q4_K_M, RTX 2060 Super 8 GB): prefill with placement 73-110 t/s against 157-213 t/s for `--n-cpu-moe` (ranking: 21 t/s); decode with the ranking (70.8 % of the profile's selections in VRAM) only +18 % over `--n-cpu-moe 40` on in-domain text; KLD 0.009 for the placements against ~0 for `--n-cpu-moe 40` (both against `--cpu-moe`).
+
+### 1. Prefill: two causes, both fixed
+
+- The skip flag keeps the cold MUL_MAT_ID on the CPU (the GPU rejects flagged nodes), while `--n-cpu-moe` / `--cpu-moe` let the scheduler offload the CPU experts to the GPU at batch >= 32 (CUDA `GGML_OP_OFFLOAD_MIN_BATCH`).
+- Found while fixing it: the copied cold bucket was in `CPU_REPACK`, and the scheduler only offloads ops whose weights are in a host buffer (`ggml_backend_buffer_is_host`; `CPU_REPACK` is not, its layout is not usable by a GPU). So even unflagged it could not be offloaded. The `--n-cpu-moe` experts are in the plain CPU buffer (mmap) or the pinned host buffer (no mmap).
+
+Fix:
+
+- `build_moe_ffn`: when `n_tokens >= GGML_OP_OFFLOAD_MIN_BATCH` (default 32, the CUDA default and the same variable) and op offload is on (not `--no-op-offload`), the cold bucket runs unflagged with a second id table (`ids_cold0`: 0 instead of -1 for the experts of the other buckets) and in the one-slot-per-row form (those zeros can repeat within a token). Below that it stays flagged, as before. No weight multiply is needed: the combine takes each slot's row by bucket id, so the dummy rows are never read.
+- The cold bucket is allocated only in host buffer types, like the `--n-cpu-moe` experts: plain CPU buffer with mmap, pinned host buffer without mmap. When the scheduler offloads it, it copies only the experts used in the batch (existing logic), i.e. only cold experts, fewer bytes than `--n-cpu-moe`.
+- Cost: at decode the cold experts use the plain CPU kernels instead of repack. `llama-cold-ffn-bench` here: repack is 10-20 % faster per expert at 4 threads (474 vs 574 us for 8 experts per layer).
+- Verified here (no GPU, so the offload itself is not): switch at the threshold (a 30-token batch stays flagged, 512 unflagged, `--no-op-offload` always flagged, checked with a debug print), logits exact against the unsplit model at `-ub 512`, `16`, `1` on CPU and with the hot bucket on an RPC device, `regress-placement.py` OK. On a CPU-only machine the exact all-cold check needs `-nr` on both sides (there `--cpu-moe` uses `CPU_REPACK`); on the CUDA machine both use the plain CPU buffer.
+- The ranking's 21 t/s is lower than the hot sets' 73-110 t/s; not explained by the flag alone. To check on the machine: VRAM use against the budget line (Task Manager, "shared GPU memory": the Windows driver can spill to system RAM when VRAM is oversubscribed, which is very slow) and the new pp numbers.
+
+### 2. Decode: where the time goes (analysis; nothing changed for decode)
+
+Checked in the code:
+
+- CUDA graphs: not disabled by the placement on this GPU. The hot MUL_MAT_ID in the one-slot-per-row form has `ne[2] = K*T = 8` at decode; on Turing and newer Q4_K / Q6_K allow MMVQ with ids up to 8 (`get_mmvq_mmid_max_batch_turing_plus`), so no stream sync and CUDA graphs stay on (older GPUs or other quant types could fall back and disable them). The CUDA backend keeps one CUDA graph per split (keyed by the first node), so the per-layer splits do not force re-capture.
+- Splits per token: the placement has a CPU split in every layer that has cold experts (48), `--n-cpu-moe 40` in 40 layers.
+- CPU threadpool / barriers: `llama-cold-ffn-bench` (one layer's cold FFN, Qwen3-30B-A3B shapes, Q4_K) here: 20-28 us per layer with 0 active experts (wake-up, barriers, skip zeroing), then 60-75 us per active expert at 4 threads (37-44 GB/s). 48 layers x ~25 us = ~1.2 ms per token: not the main cost.
+- Expected CPU expert work per token: `--n-cpu-moe 40` 40 x 8 = 320 expert FFNs; the ranking at 70.8 % 48 x 2.3 = ~112, about a third. If the CPU expert time were the bottleneck, decode would gain much more than +18 %.
+
+So the missing time is elsewhere. Candidates, to be measured on the machine (the `-SkipProfile` section of `measure-windows.ps1` does it):
+
+1. The real hit rate on the decode text is lower than the profile share (70.8 % is the share of the profile's selections, not of the test text). Check: trace the decode prompt with `llama-expert-trace` and compare with the hot set.
+2. Per-split sync and copy latency (Windows WDDM), 48 CPU round trips per token: `GGML_SCHED_TIMING=2` shows copy+sync per split and layer.
+3. Hot bucket GPU time (one-slot-per-row repeat, cold slots computed with hot expert 0 and dropped): GPU compute per layer in the same output.
+4. Thread count: decode at `-t 4/6/8`.
+
+New measurement tools:
+
+- `GGML_SCHED_TIMING=1|2` (ggml scheduler, off by default): after each split the split backend is synchronized and its input copy (with waits) and compute are timed; 1 prints one line per graph with totals per backend, 2 also one line per split with the first named node (carries the layer number). At decode every GPU split is followed by a CPU split that waits for it anyway, so the extra syncs change little there.
+- `tools/expert-trace/sched-timing-summary.py`: average per token by backend and a per-layer table from that output.
+- `llama-cold-ffn-bench [repack] [threads ...]`: the CPU cold FFN microbenchmark above.
+- The RPC stand-in is not usable for these timings: TCP instead of PCIe, and the rpc-server shares the CPU cores with the client.
+
+### 3. KLD 0.009: likely causes and the test
+
+- The proposed test (`--cpu-moe --load-mode none` vs `--cpu-moe` with mmap) does not isolate repack on the CUDA machine: without mmap the `--cpu-moe` experts go to the pinned host buffer (plain kernels, not `CPU_REPACK`), so both runs use the same kernels.
+- A second, probably larger source: `llama-perplexity -c 512` runs batches of 512, where `--cpu-moe` and `--n-cpu-moe 40` offload all experts to the GPU (identical CUDA kernels, KLD ~0 between them), while the flagged cold bucket of the placements ran on the CPU (repack, q8_K activations) - a CPU-vs-GPU kernel difference for ~30 % of the expert work. The prefill fix removes both: the cold bucket is in a plain host buffer and is offloaded at batch 512 like the baseline, so the KLD of the placements should drop toward the `--n-cpu-moe 40` level.
+- Decomposition added to `measure-windows.ps1` (at `-ub 16` nothing is offloaded): `kld-cpu-vs-gpu-kernels` = `--cpu-moe -ub 16` (CPU plain kernels) against the `-c 512` reference (GPU kernels); `kld-repack-vs-plain` = `--cpu-moe --no-host -ub 16` (`CPU_REPACK`) against `--cpu-moe -ub 16`.
+- Here (CPU, random-weight 8-layer MoE with small embeddings so the softmax is not saturated): repack vs plain KLD 0.0039, but the same plain kernels at `-ub 8` vs `-ub 256` also give 0.018. On a random MoE any kernel change flips near-tied router choices, so these values say nothing about the size on Qwen3; only the measurement on the machine can rank the two causes.
+
 ## Coding rules
 
 - Minimal diffs in core files; prefer new files under `tools/`.

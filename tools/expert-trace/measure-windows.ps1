@@ -20,7 +20,9 @@ param(
     [double] $MinFreeRamGB = 20,
     [string] $TextPrompt = "",                 # held-out text prompt; default: heldout_sr.txt in the repo root if present
     [string] $CodePrompt = "",                 # held-out code prompt; default: a part of src/llama-sampler.cpp
-    [switch] $SkipKld
+    [int[]]  $ProfileThreads = @(4, 6, 8),    # decode thread sweep of the profile section
+    [switch] $SkipKld,
+    [switch] $SkipProfile
 )
 
 $ErrorActionPreference = "Continue"
@@ -46,12 +48,16 @@ function Quote-Arg([string] $a) {
 }
 
 # runs one step; stdout and stderr go to one log file; returns the log path
-function Invoke-Step([string] $Name, [string] $Exe, [string[]] $ArgList) {
+function Invoke-Step([string] $Name, [string] $Exe, [string[]] $ArgList, [hashtable] $EnvVars = @{}) {
     $script:StepNo++
     $log = Join-Path $ResultsDir ("{0:D2}-{1}.log" -f $script:StepNo, $Name)
     $argString = ($ArgList | ForEach-Object { Quote-Arg $_ }) -join " "
     Write-Log "START $Name"
     Set-Content -Path $log -Value ("# {0} {1}`n# started {2}`n" -f $Exe, $argString, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+    foreach ($k in $EnvVars.Keys) {
+        Set-Item -Path ("env:" + $k) -Value $EnvVars[$k]
+        Add-Content -Path $log -Value ("# env {0}={1}" -f $k, $EnvVars[$k])
+    }
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $code = -1
     try {
@@ -62,6 +68,9 @@ function Invoke-Step([string] $Name, [string] $Exe, [string[]] $ArgList) {
         Add-Content -Path $log -Value ("could not start: " + $_.Exception.Message)
     }
     $sw.Stop()
+    foreach ($k in $EnvVars.Keys) {
+        Remove-Item -Path ("env:" + $k) -ErrorAction SilentlyContinue
+    }
     foreach ($f in @("$log.out", "$log.err")) {
         if (Test-Path $f) {
             $text = Get-Content -Path $f -Raw
@@ -178,6 +187,12 @@ if ($SkipKld) {
     foreach ($k in $kldRuns.Keys) {
         Invoke-Step ("kld-" + $k) (Bin "llama-perplexity") ($ppl + $kldRuns[$k] + @("--kl-divergence-base", $kldBase, "--kl-divergence")) | Out-Null
     }
+    # where the KLD comes from: at -c 512 the baseline offloads all experts to the GPU (batch >= 32);
+    # at -ub 16 nothing is offloaded, so the experts run on the CPU with plain kernels (mmap) or repack (--no-host)
+    Invoke-Step "kld-cpu-vs-gpu-kernels" (Bin "llama-perplexity") ($ppl + @("--cpu-moe", "-ub", "16", "--kl-divergence-base", $kldBase, "--kl-divergence")) | Out-Null
+    $kldBase16 = Join-Path $ResultsDir "ref-ub16.kld"
+    Invoke-Step "kld-ref-cpumoe-ub16" (Bin "llama-perplexity") ($ppl + @("--cpu-moe", "-ub", "16", "--kl-divergence-base", $kldBase16)) | Out-Null
+    Invoke-Step "kld-repack-vs-plain" (Bin "llama-perplexity") ($ppl + @("--cpu-moe", "--no-host", "-ub", "16", "--kl-divergence-base", $kldBase16, "--kl-divergence")) | Out-Null
 }
 
 # ---------------------------------------------------------------- 3. llama-batched-bench (random tokens)
@@ -222,6 +237,26 @@ Invoke-Step "llama-bench-kv-f16"  (Bin "llama-bench") ($benchCommon + @("-fa", "
 Write-Log "q8_0 KV cache only with -fa on: a quantized V cache requires flash attention"
 Invoke-Step "llama-bench-kv-q8_0" (Bin "llama-bench") ($benchCommon + @("-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0")) | Out-Null
 
+# ---------------------------------------------------------------- 6. decode profile
+$timingSummary = Join-Path $RepoRoot "tools\expert-trace\sched-timing-summary.py"
+if ($SkipProfile) {
+    Skip-Step "profile" "-SkipProfile"
+} else {
+    foreach ($k in @("ncmoe40", "rank")) {
+        # per split and layer: GPU compute, CPU compute, copy + sync (each split is synchronized, see GGML_SCHED_TIMING)
+        $l = Invoke-Step ("profile-" + $k) (Bin "llama-completion") ($common + $configs[$k] + @("-f", $CodePrompt, "-n", "64", "--temp", "0", "--ignore-eos", "-no-cnv")) @{ "GGML_SCHED_TIMING" = "2" }
+        Invoke-Step ("profile-" + $k + "-summary") $Python @($timingSummary, $l, "--last", "48") | Out-Null
+        # CUDA graphs on (default) vs off: no difference means they are not used or do not matter
+        Invoke-Step ("profile-" + $k + "-nographs") (Bin "llama-completion") ($common + $configs[$k] + @("-f", $CodePrompt, "-n", "64", "--temp", "0", "--ignore-eos", "-no-cnv")) @{ "GGML_CUDA_DISABLE_GRAPHS" = "1" } | Out-Null
+        foreach ($t in $ProfileThreads) {
+            Invoke-Step ("profile-{0}-t{1}" -f $k, $t) (Bin "llama-completion") ($common + $configs[$k] + @("-f", $CodePrompt, "-n", "64", "--temp", "0", "--ignore-eos", "-no-cnv", "-t", "$t")) | Out-Null
+        }
+    }
+    # CPU cold FFN of one layer at Qwen3-30B-A3B shapes: fixed cost per layer vs cost per active expert
+    Invoke-Step "cold-ffn-bench-plain"  (Bin "llama-cold-ffn-bench") ([string[]] ($ProfileThreads + @(1))) | Out-Null
+    Invoke-Step "cold-ffn-bench-repack" (Bin "llama-cold-ffn-bench") ([string[]] (@("repack") + $ProfileThreads + @(1))) | Out-Null
+}
+
 # ---------------------------------------------------------------- summary
 function Get-Log([string] $step) {
     $r = $script:Results | Where-Object { $_.Step -eq $step } | Select-Object -First 1
@@ -255,7 +290,7 @@ $sum += "## KL-divergence vs --cpu-moe"
 $sum += ""
 $sum += "| run | Mean KLD | 99.9% KLD | Same top p | PPL(Q)/PPL(base) |"
 $sum += "|---|---|---|---|---|"
-foreach ($k in @("noise-ncmoe40", "p3g", "p5g", "rank")) {
+foreach ($k in @("noise-ncmoe40", "p3g", "p5g", "rank", "cpu-vs-gpu-kernels", "repack-vs-plain")) {
     $l = Get-Log ("kld-" + $k)
     if (-not $l) { continue }
     $get = { param($pat) $m = Select-String -Path $l -Pattern $pat | Select-Object -Last 1; if ($m) { ($m.Line -split ":", 2)[1].Trim() } else { "-" } }
@@ -310,6 +345,37 @@ foreach ($k in @("ncmoe48", "ncmoe40", "p3g", "p5g", "rank")) {
     $sum += '```'
     $sum += (Select-String -Path $l -Pattern "common_moe_placement_resolve|moe placement|model buffer size|KV buffer size|compute buffer size" |
         Where-Object { $_.Line -notmatch "= +0\.00 MiB" } | ForEach-Object { $_.Line })
+    $sum += '```'
+}
+
+$sum += ""
+$sum += "## Decode profile (GGML_SCHED_TIMING=2, code prompt, 64 tokens; the timing run syncs after every split)"
+foreach ($k in @("ncmoe40", "rank")) {
+    $l = Get-Log ("profile-" + $k + "-summary")
+    if (-not $l) { continue }
+    $sum += ""
+    $sum += "### $k"
+    $sum += '```'
+    $sum += (Get-Content -Path $l | Where-Object { $_ -notmatch "^#" -and $_ -ne "" })
+    $sum += '```'
+    $sum += ""
+    $sum += "| run | eval t/s |"
+    $sum += "|---|---|"
+    $names = @(("profile-" + $k + "-nographs")) + ($ProfileThreads | ForEach-Object { "profile-{0}-t{1}" -f $k, $_ })
+    foreach ($n in $names) {
+        $l2 = Get-Log $n
+        if (-not $l2) { continue }
+        $ev = Select-String -Path $l2 -Pattern "\seval time.*?([0-9.]+) tokens per second" | Where-Object { $_.Line -notmatch "prompt eval" } | Select-Object -Last 1
+        $sum += ("| {0} | {1} |" -f $n, $(if ($ev) { $ev.Matches[0].Groups[1].Value } else { "-" }))
+    }
+}
+foreach ($k in @("cold-ffn-bench-plain", "cold-ffn-bench-repack")) {
+    $l = Get-Log $k
+    if (-not $l) { continue }
+    $sum += ""
+    $sum += "### $k"
+    $sum += '```'
+    $sum += (Get-Content -Path $l | Where-Object { $_ -notmatch "^#" -and $_ -notmatch "repack tensor" -and $_ -ne "" })
     $sum += '```'
 }
 

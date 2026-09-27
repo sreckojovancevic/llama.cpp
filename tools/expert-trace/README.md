@@ -108,6 +108,8 @@ Runs that use other kernels (hot experts on the GPU) are not bit-exact; judge th
 
 `regress-placement.py` builds a tiny 48-layer qwen3moe and checks that a hot-set and a ranking placement give exact logits (`-- --rpc host:port -ngl 99` to put the hot bucket on a device). `measure-windows.ps1` runs the whole measurement sequence unattended on Windows and writes `results\moe-<date>\summary.md`.
 
+Profiling: `GGML_SCHED_TIMING=2` (ggml scheduler) prints the time of every graph split; `sched-timing-summary.py log.txt` averages it per token and per layer. `llama-cold-ffn-bench [repack] [threads ...]` times one layer's CPU cold FFN at Qwen3-30B-A3B shapes for 0..8 active experts.
+
 ## Sample
 
 `sample/` has two traces (`text.csv`, `code.csv`) from a tiny random-weight llama-arch MoE (6 layers, 16 experts, top-4, Q8_0 experts). They only exercise the tool and the analysis. The routing distribution of a random model says nothing about real models.
