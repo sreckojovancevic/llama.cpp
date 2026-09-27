@@ -1819,7 +1819,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (pimpl->moe_placement) {
+        const size_t first = pimpl->ctxs_bufs.size();
         pimpl->moe_placement->alloc(ml.no_alloc, pimpl->ctxs_bufs);
+
+        // the placement tensors are model tensors too (n_tensors() sizes the graph)
+        for (size_t i = first; i < pimpl->ctxs_bufs.size(); ++i) {
+            ggml_context * ctx = pimpl->ctxs_bufs[i].first.get();
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                tensors_by_name.emplace_back(ggml_get_name(t), t);
+            }
+        }
     }
 
     if (llama_supports_gpu_offload()) {
@@ -1913,6 +1922,19 @@ size_t llama_model::size() const {
 
 size_t llama_model::n_tensors() const {
     return tensors_by_name.size();
+}
+
+uint32_t llama_model::n_moe_placement_nodes() const {
+    // per bucket: id get_rows, repeat and reshapes, 3 MUL_MAT_ID, GLU, concat (~10); per layer: cont, bucket get_rows,
+    // select, reshapes (~6); doubled for headroom
+    uint32_t res = 0;
+    for (const auto & layer : layers) {
+        if (layer.moe_pl.bucket) {
+            const uint32_t n_buckets = (layer.moe_pl.up_hot ? 1 : 0) + (layer.moe_pl.up_cold ? 1 : 0);
+            res += 2*(6 + 10*n_buckets);
+        }
+    }
+    return res;
 }
 
 size_t llama_model::n_devices() const {

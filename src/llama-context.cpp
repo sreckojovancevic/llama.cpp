@@ -2332,6 +2332,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             res += lora->get_n_nodes();
         }
     }
+    res += model.n_moe_placement_nodes();
 
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;

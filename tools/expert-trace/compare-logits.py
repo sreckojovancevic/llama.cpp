@@ -36,11 +36,18 @@ DEFAULT_PROMPT = (
 )
 
 
+def split_args(s):
+    # POSIX splitting would eat the backslashes of Windows paths
+    if os.name == "nt":
+        return [t[1:-1] if len(t) > 1 and t[0] == t[-1] == '"' else t for t in shlex.split(s, posix=False)]
+    return shlex.split(s)
+
+
 def run_debug(args, name, run_args, ubatch, out_root):
     out_dir = os.path.join(out_root, f"{name}-ub{ubatch}")
     os.makedirs(out_dir, exist_ok=True)
     cmd = [args.llama_debug, "-m", args.model, "-p", args.prompt, "--save-logits", "--logits-output-dir", out_dir,
-           "-b", "2048", "-ub", str(ubatch)] + shlex.split(run_args) + args.common
+           "-b", "2048", "-ub", str(ubatch)] + split_args(run_args) + args.common
     log = os.path.join(out_root, f"{name}-ub{ubatch}.log")
     with open(log, "w") as f:
         r = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)

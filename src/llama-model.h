@@ -746,6 +746,9 @@ struct llama_model {
 
     size_t size() const; // file size
     size_t n_tensors() const;
+
+    // extra graph nodes of the MoE placement (bucket FFNs, id mapping, combine), 0 without it
+    uint32_t n_moe_placement_nodes() const;
     size_t n_devices() const;
     const float * tensor_split() const;
 
