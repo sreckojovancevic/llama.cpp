@@ -1717,6 +1717,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_ram_pin   = params.moe.ram_pin;
     mparams.moe_warm      = params.moe.warm.data();
     mparams.n_moe_warm    = params.moe.warm.size() / 2;
+    mparams.moe_devices   = params.moe.dev_ptrs.empty() ? nullptr : params.moe.dev_ptrs.data();
+    mparams.moe_hot_dev   = params.moe.hot_dev.data();
 
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;

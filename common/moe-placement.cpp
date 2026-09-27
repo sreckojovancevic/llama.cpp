@@ -161,6 +161,9 @@ static std::map<int, int64_t> expert_bytes_from_gguf(const std::string & path) {
 void common_moe_placement_resolve(common_params & params, llama_model_params & mparams, const llama_context_params & cparams) {
     common_params_moe_placement & moe = params.moe;
     if (!moe.enabled || moe.ranking.empty()) {
+        if (!moe.devices.empty()) {
+            throw std::invalid_argument("--moe-devices needs --moe-placement with a ranking file (analyze.py --emit-ranking)");
+        }
         if (moe.enabled && moe.ram_pin) {
             LOG_WRN("%s: --moe-ram-pin needs a ranking file (analyze.py --emit-ranking), ignored\n", __func__);
             moe.ram_pin = false;
@@ -200,20 +203,43 @@ void common_moe_placement_resolve(common_params & params, llama_model_params & m
         return a.second < b.second;
     });
 
-    // probe: the top expert of each layer is hot, so every layer has both buckets as in the final graph
-    std::map<int, const common_moe_expert_rank *> top;
-    for (const auto & r : R) {
-        auto & t = top[r.layer];
-        if (!t || r.count > t->count) {
-            t = &r;
+    // hot devices: --moe-devices in the listed order, or one slot for the first model device
+    std::vector<ggml_backend_dev_t> hot_devs;
+    for (const auto & name : moe.devices) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            throw std::invalid_argument("--moe-devices: invalid device " + name + " (see --list-devices)");
         }
+        hot_devs.push_back(dev);
+    }
+    const int n_slots = hot_devs.empty() ? 1 : (int) hot_devs.size();
+    if (moe.vram_margin.size() != 1 && (int) moe.vram_margin.size() != n_slots) {
+        throw std::invalid_argument("--moe-vram-margin: give one value or one per --moe-devices entry");
+    }
+
+    // probe: expert number s (by count) of every layer is hot on slot s, so every layer has all buckets as in the
+    // final graph and the compute buffers of every device are measured
+    std::map<int, std::vector<const common_moe_expert_rank *>> by_layer;
+    for (const auto & r : R) {
+        by_layer[r.layer].push_back(&r);
     }
     std::vector<int32_t> probe;
-    int64_t probe_bytes = 0;
-    for (const auto & [il, r] : top) {
-        probe.push_back(il);
-        probe.push_back(r->id);
-        probe_bytes += r->bytes;
+    std::vector<int32_t> probe_dev;
+    std::vector<int64_t> probe_bytes(n_slots, 0);
+    for (auto & [il, v] : by_layer) {
+        std::stable_sort(v.begin(), v.end(), [](const auto * x, const auto * y) { return x->count > y->count; });
+        for (int sl = 0; sl < n_slots && sl < (int) v.size(); sl++) {
+            probe.push_back(il);
+            probe.push_back(v[sl]->id);
+            probe_dev.push_back(sl);
+            probe_bytes[sl] += v[sl]->bytes;
+        }
+    }
+
+    moe.dev_ptrs.clear();
+    if (!hot_devs.empty()) {
+        moe.dev_ptrs = hot_devs;
+        moe.dev_ptrs.push_back(nullptr);
     }
 
     llama_model_params mp = mparams;
@@ -223,6 +249,8 @@ void common_moe_placement_resolve(common_params & params, llama_model_params & m
     mp.moe_ram_pin   = false;
     mp.moe_warm      = nullptr;
     mp.n_moe_warm    = 0;
+    mp.moe_devices   = moe.dev_ptrs.empty() ? nullptr : moe.dev_ptrs.data();
+    mp.moe_hot_dev   = probe_dev.data();
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0;
@@ -231,34 +259,53 @@ void common_moe_placement_resolve(common_params & params, llama_model_params & m
     const auto dmd = common_get_device_memory_data(params.model.path.c_str(), &mp, &cparams, devs, hp_ngl, hp_nct, hp_nex,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 
-    int64_t vram_budget = 0;
-    std::string budget_desc = "no GPU device, all experts stay on the CPU";
-    if (!devs.empty()) {
-        const auto & d = dmd[0];
-        const int64_t trunk = (int64_t) d.model - probe_bytes;
-        vram_budget = std::max<int64_t>(0, d.free - trunk - (int64_t) d.context - (int64_t) d.compute - moe.vram_margin);
-        budget_desc = string_format("%s: free %lld MiB - trunk %lld MiB - KV %lld MiB (n_ctx %u) - compute %lld MiB - margin %lld MiB = %lld MiB",
-                ggml_backend_dev_name(devs[0]), (long long) (d.free/MiB), (long long) (trunk/MiB), (long long) (d.context/MiB), cparams.n_ctx,
-                (long long) (d.compute/MiB), (long long) (moe.vram_margin/MiB), (long long) (vram_budget/MiB));
-        if (devs.size() > 1) {
-            LOG_WRN("%s: %zu devices; the VRAM budget is only computed for %s\n", __func__, devs.size(), ggml_backend_dev_name(devs[0]));
-        }
-        if (cparams.n_ctx == 0) {
-            LOG_WRN("%s: n_ctx = 0 (training context); set -c to the context you use, the KV cache takes VRAM from the experts\n", __func__);
-        }
+    if (hot_devs.empty() && devs.size() > 1) {
+        LOG_WRN("%s: %zu devices; the VRAM budget is only computed for %s (use --moe-devices for more)\n", __func__, devs.size(), ggml_backend_dev_name(devs[0]));
+    }
+    if (!devs.empty() && cparams.n_ctx == 0) {
+        LOG_WRN("%s: n_ctx = 0 (training context); set -c to the context you use, the KV cache takes VRAM from the experts\n", __func__);
     }
 
-    // hot tier: greedy, an expert that does not fit is skipped and smaller ones may still fit
-    std::vector<char> is_hot(order.size(), 0);
-    int64_t used = 0;
+    // budget per slot: free - (model - probe experts) - KV - compute - margin, from the device's share of the dry run
+    std::vector<int64_t>     vram_budget(n_slots, 0);
+    std::vector<std::string> slot_name(n_slots, "-");
+    std::vector<std::string> budget_desc(n_slots, "no GPU device, all experts stay on the CPU");
+    for (int sl = 0; sl < n_slots; sl++) {
+        ggml_backend_dev_t dev = hot_devs.empty() ? (devs.empty() ? nullptr : devs[0]) : hot_devs[sl];
+        if (!dev) {
+            continue;
+        }
+        const auto it = std::find(devs.begin(), devs.end(), dev);
+        if (it == devs.end()) {
+            throw std::invalid_argument(std::string("--moe-devices: device ") + ggml_backend_dev_name(dev) + " is not used by the model (check -dev / --rpc)");
+        }
+        const auto & d = dmd[it - devs.begin()];
+        const int64_t trunk  = (int64_t) d.model - probe_bytes[sl];
+        const int64_t margin = moe.vram_margin[moe.vram_margin.size() == 1 ? 0 : sl];
+        vram_budget[sl] = std::max<int64_t>(0, d.free - trunk - (int64_t) d.context - (int64_t) d.compute - margin);
+        slot_name[sl]   = ggml_backend_dev_name(dev);
+        budget_desc[sl] = string_format("%s: free %lld MiB - trunk %lld MiB - KV %lld MiB (n_ctx %u) - compute %lld MiB - margin %lld MiB = %lld MiB",
+                slot_name[sl].c_str(), (long long) (d.free/MiB), (long long) (trunk/MiB), (long long) (d.context/MiB), cparams.n_ctx,
+                (long long) (d.compute/MiB), (long long) (margin/MiB), (long long) (vram_budget[sl]/MiB));
+    }
+
+    // hot tiers: devices in order, each filled greedily from the hottest unassigned experts; an expert that does not
+    // fit is skipped and smaller ones may still fit
+    // assign: >= 0 hot slot, -1 cold, -2 RAM tier
+    std::vector<int> assign(order.size(), -1);
     moe.hot.clear();
-    for (size_t i = 0; i < order.size(); i++) {
-        const auto * r = order[i].first;
-        if (used + r->bytes <= vram_budget) {
-            used += r->bytes;
-            is_hot[i] = 1;
-            moe.hot.push_back(r->layer);
-            moe.hot.push_back(r->id);
+    moe.hot_dev.clear();
+    for (int sl = 0; sl < n_slots; sl++) {
+        int64_t used = 0;
+        for (size_t i = 0; i < order.size(); i++) {
+            const auto * r = order[i].first;
+            if (assign[i] == -1 && used + r->bytes <= vram_budget[sl]) {
+                used += r->bytes;
+                assign[i] = sl;
+                moe.hot.push_back(r->layer);
+                moe.hot.push_back(r->id);
+                moe.hot_dev.push_back(sl);
+            }
         }
     }
 
@@ -277,7 +324,11 @@ void common_moe_placement_resolve(common_params & params, llama_model_params & m
                 all_experts += r.bytes;
             }
             const auto & h = dmd.back();
-            const int64_t host_other = std::max<int64_t>(0, (int64_t) h.model - (all_experts - probe_bytes)) + (int64_t) h.context + (int64_t) h.compute;
+            int64_t probe_all = 0;
+            for (int64_t pb : probe_bytes) {
+                probe_all += pb;
+            }
+            const int64_t host_other = std::max<int64_t>(0, (int64_t) h.model - (all_experts - probe_all)) + (int64_t) h.context + (int64_t) h.compute;
             const int64_t avail = host_available_memory();
             constexpr int64_t reserve = 2048*MiB;
             ram_budget = std::max<int64_t>(0, avail - host_other - reserve);
@@ -287,9 +338,9 @@ void common_moe_placement_resolve(common_params & params, llama_model_params & m
         int64_t ram_used = 0;
         for (size_t i = 0; i < order.size(); i++) {
             const auto * r = order[i].first;
-            if (!is_hot[i] && ram_used + r->bytes <= ram_budget) {
+            if (assign[i] == -1 && ram_used + r->bytes <= ram_budget) {
                 ram_used += r->bytes;
-                is_hot[i] = 2;
+                assign[i] = -2;
                 moe.warm.push_back(r->layer);
                 moe.warm.push_back(r->id);
             }
@@ -298,28 +349,37 @@ void common_moe_placement_resolve(common_params & params, llama_model_params & m
 
     // report
     struct tier { size_t n = 0; int64_t bytes = 0; int64_t count = 0; };
-    tier tiers[3];
+    std::vector<tier> hot_tiers(n_slots);
+    tier warm_tier;
+    tier cold_tier;
     for (size_t i = 0; i < order.size(); i++) {
-        const int t = is_hot[i] == 1 ? 0 : is_hot[i] == 2 ? 1 : 2;
-        tiers[t].n++;
-        tiers[t].bytes += order[i].first->bytes;
-        tiers[t].count += order[i].first->count;
+        tier & t = assign[i] >= 0 ? hot_tiers[assign[i]] : assign[i] == -2 ? warm_tier : cold_tier;
+        t.n++;
+        t.bytes += order[i].first->bytes;
+        t.count += order[i].first->count;
     }
     const double nsel = (double) std::max<int64_t>(moe.n_selections, 1);
-    LOG_INF("%s: moe placement from ranking (profile %s, %lld selections, %zu experts)\n", __func__,
-            moe.profile.c_str(), (long long) moe.n_selections, R.size());
-    LOG_INF("%s:   VRAM budget: %s\n", __func__, budget_desc.c_str());
+    LOG_INF("%s: moe placement from ranking (profile %s, %lld selections, %zu experts)%s\n", __func__,
+            moe.profile.c_str(), (long long) moe.n_selections, R.size(),
+            hot_devs.empty() ? "" : " [EXPERIMENTAL multi-device, not tested on real multi-GPU]");
+    for (int sl = 0; sl < n_slots; sl++) {
+        LOG_INF("%s:   VRAM budget: %s\n", __func__, budget_desc[sl].c_str());
+    }
     if (moe.ram_pin) {
         LOG_INF("%s:   RAM budget: %lld MiB (%s)\n", __func__, (long long) (ram_budget/MiB), ram_desc.c_str());
     }
-    LOG_INF("%s:   %-12s %8s %12s %22s\n", __func__, "tier", "experts", "MiB", "share of selections");
-    const char * names[3] = { "VRAM (hot)", "RAM (pinned)", moe.ram_pin ? "disk (mmap)" : "RAM (cold)" };
-    for (int t = 0; t < 3; t++) {
-        if (t == 1 && !moe.ram_pin) {
-            continue;
-        }
-        LOG_INF("%s:   %-12s %8zu %12.1f %21.1f%%\n", __func__, names[t], tiers[t].n, tiers[t].bytes/(double) MiB, 100.0*tiers[t].count/nsel);
+    LOG_INF("%s:   %-20s %8s %12s %22s\n", __func__, "tier", "experts", "MiB", "share of selections");
+    const char * fn = __func__;
+    auto row = [&](const std::string & name, const tier & t) {
+        LOG_INF("%s:   %-20s %8zu %12.1f %21.1f%%\n", fn, name.c_str(), t.n, t.bytes/(double) MiB, 100.0*t.count/nsel);
+    };
+    for (int sl = 0; sl < n_slots; sl++) {
+        row(hot_devs.empty() ? std::string("VRAM (hot)") : "VRAM " + slot_name[sl], hot_tiers[sl]);
     }
+    if (moe.ram_pin) {
+        row("RAM (pinned)", warm_tier);
+    }
+    row(moe.ram_pin ? "disk (mmap)" : "RAM (cold)", cold_tier);
 
     mparams.moe_placement = true;
     mparams.moe_hot       = moe.hot.data();
@@ -327,4 +387,6 @@ void common_moe_placement_resolve(common_params & params, llama_model_params & m
     mparams.moe_ram_pin   = moe.ram_pin;
     mparams.moe_warm      = moe.warm.data();
     mparams.n_moe_warm    = moe.warm.size() / 2;
+    mparams.moe_devices   = moe.dev_ptrs.empty() ? nullptr : moe.dev_ptrs.data();
+    mparams.moe_hot_dev   = moe.hot_dev.data();
 }

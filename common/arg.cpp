@@ -2780,12 +2780,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PLACEMENT"));
     add_opt(common_arg(
-        {"--moe-vram-margin"}, "SIZE",
-        string_format("VRAM to leave free when --moe-placement uses a ranking, e.g. 512M, 1G (default: %lldM)", (long long) (params.moe.vram_margin >> 20)),
+        {"--moe-vram-margin"}, "SIZE[,SIZE,..]",
+        string_format("VRAM to leave free when --moe-placement uses a ranking, e.g. 512M, 1G; with --moe-devices one value\n"
+            "per device, or one for all (default: %lldM)", (long long) (params.moe.vram_margin[0] >> 20)),
         [](common_params & params, const std::string & value) {
-            params.moe.vram_margin = common_parse_size(value);
+            params.moe.vram_margin.clear();
+            for (const auto & v : string_split<std::string>(value, ',')) {
+                params.moe.vram_margin.push_back(common_parse_size(v));
+            }
         }
     ).set_env("LLAMA_ARG_MOE_VRAM_MARGIN"));
+    add_opt(common_arg(
+        {"--moe-devices"}, "<dev1,dev2,..>",
+        "[EXPERIMENTAL, not tested on real multi-GPU] with a --moe-placement ranking: one hot expert bucket per listed\n"
+        "device (e.g. CUDA0,CUDA1 or CUDA0,RPC0), each with its own VRAM budget, filled in the listed order with the\n"
+        "hottest experts first; the devices must be used by the model (see --list-devices, -dev, --rpc)",
+        [](common_params & params, const std::string & value) {
+            params.moe.devices = string_split<std::string>(value, ',');
+        }
+    ).set_env("LLAMA_ARG_MOE_DEVICES"));
     add_opt(common_arg(
         {"--moe-ram-pin"}, "SIZE|auto",
         "with a --moe-placement ranking: lock the next-hottest cold experts in RAM up to SIZE (auto: available RAM\n"

@@ -1930,8 +1930,7 @@ uint32_t llama_model::n_moe_placement_nodes() const {
     uint32_t res = 0;
     for (const auto & layer : layers) {
         if (layer.moe_pl.bucket) {
-            const uint32_t n_buckets = (layer.moe_pl.up_hot ? 1 : 0) + (layer.moe_pl.up_cold ? 1 : 0);
-            res += 2*(6 + 10*n_buckets);
+            res += 2*(6 + 10*(uint32_t) layer.moe_pl.buckets.size());
         }
     }
     return res;
@@ -2825,6 +2824,8 @@ llama_model_params llama_model_default_params() {
         /*.n_moe_hot                   =*/ 0,
         /*.moe_warm                    =*/ nullptr,
         /*.n_moe_warm                  =*/ 0,
+        /*.moe_devices                 =*/ nullptr,
+        /*.moe_hot_dev                 =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
@@ -3305,15 +3306,28 @@ bool llama_model_base::create_tensor_moe_placement(llama_layer & layer, int bid,
     const std::string name_up   = check(LLM_TENSOR_FFN_UP_EXPS,   {n_embd_, n_ff_,   n_expert_});
     const std::string name_down = check(LLM_TENSOR_FFN_DOWN_EXPS, {n_ff_,   n_embd_, n_expert_});
 
-    // hot bucket: the layer device if it is a GPU, else the first GPU, else the CPU
-    const buft_list_t * hot_bufts = pimpl->dev_layer.at(bid).buft_list;
-    if (ggml_backend_dev_type(pimpl->dev_layer.at(bid).dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-        for (const auto & d : devices) {
-            if (pimpl->gpu_buft_list.count(d.dev)) {
-                hot_bufts = &pimpl->gpu_buft_list.at(d.dev);
-                break;
+    std::vector<const buft_list_t *> hot_bufts;
+    if (params.moe_devices) {
+        // one hot bucket per listed device
+        for (int i = 0; params.moe_devices[i]; ++i) {
+            auto it = pimpl->gpu_buft_list.find(params.moe_devices[i]);
+            if (it == pimpl->gpu_buft_list.end()) {
+                throw std::runtime_error(format("moe placement: device %s is not used by the model", ggml_backend_dev_name(params.moe_devices[i])));
+            }
+            hot_bufts.push_back(&it->second);
+        }
+    } else {
+        // one hot bucket: the layer device if it is a GPU, else the first GPU, else the CPU
+        const buft_list_t * bufts = pimpl->dev_layer.at(bid).buft_list;
+        if (ggml_backend_dev_type(pimpl->dev_layer.at(bid).dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            for (const auto & d : devices) {
+                if (pimpl->gpu_buft_list.count(d.dev)) {
+                    bufts = &pimpl->gpu_buft_list.at(d.dev);
+                    break;
+                }
             }
         }
+        hot_bufts.push_back(bufts);
     }
 
     // RAM pin with mmap: the cold bucket is the merged tensor in the file mapping (plain CPU buffer, not repacked)
@@ -3326,8 +3340,11 @@ bool llama_model_base::create_tensor_moe_placement(llama_layer & layer, int bid,
         merged[2] = ml->create_tensor(hparams, &cpu_only, &cpu_only, &cpu_only, &cpu_only, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", bid), {n_ff_,   n_embd_, n_expert_}, 0);
     }
 
+    const auto & ld = pimpl->dev_layer.at(bid);
+    const buft_list_t * layer_bufts = ggml_backend_dev_type(ld.dev) == GGML_BACKEND_DEVICE_TYPE_CPU ? nullptr : ld.buft_list;
+
     pimpl->moe_placement->create_layer(*ml, layer.moe_pl, bid, name_gate, name_up, name_down,
-            *hot_bufts, pimpl->cpu_buft_list, ggml_backend_cpu_buffer_type(), merged[0] ? merged : nullptr);
+            hot_bufts, layer_bufts, pimpl->cpu_buft_list, ggml_backend_cpu_buffer_type(), merged[0] ? merged : nullptr);
 
     return true;
 }

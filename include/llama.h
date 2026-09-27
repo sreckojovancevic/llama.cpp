@@ -349,6 +349,12 @@ extern "C" {
         const int32_t * moe_warm;
         size_t          n_moe_warm;
 
+        // [EXPERIMENTAL, not tested on real multi-GPU] NULL-terminated list of devices for hot experts; moe_hot_dev[i] is the
+        // index in this list of the device of pair i of moe_hot
+        // NULL: one hot bucket per layer, on the layer device if it is a GPU, else on the first GPU
+        ggml_backend_dev_t * moe_devices;
+        const int32_t *      moe_hot_dev;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

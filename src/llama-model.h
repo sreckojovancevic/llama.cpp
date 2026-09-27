@@ -251,20 +251,19 @@ struct llama_layer_switch_lora {
     struct ggml_tensor * b_down = nullptr;
 };
 
-// static hot/cold MoE expert placement (llama_model_params::moe_placement)
-struct llama_layer_moe_placement {
-    // expert slices, nullptr when the bucket is empty
-    struct ggml_tensor * gate_hot  = nullptr;
-    struct ggml_tensor * up_hot    = nullptr;
-    struct ggml_tensor * down_hot  = nullptr;
-    struct ggml_tensor * gate_cold = nullptr;
-    struct ggml_tensor * up_cold   = nullptr;
-    struct ggml_tensor * down_cold = nullptr;
+// experts of one layer that are computed on one device (llama_model_params::moe_placement)
+struct llama_moe_bucket {
+    struct ggml_tensor * gate = nullptr;
+    struct ggml_tensor * up   = nullptr;
+    struct ggml_tensor * down = nullptr;
+    struct ggml_tensor * ids  = nullptr; // I32 [1, n_expert]: global -> local id; other experts: 0 (hot bucket) or -1 (cold bucket)
+    bool                 skip = false;   // MUL_MAT_ID skip flag: ids < 0 are skipped (cold bucket, when the layer has other buckets)
+};
 
-    // global expert id -> local id, I32 [1, n_expert]
-    struct ggml_tensor * ids_hot  = nullptr; // local id in hot bucket, 0 for cold experts
-    struct ggml_tensor * ids_cold = nullptr; // local id in cold bucket, -1 for hot experts
-    struct ggml_tensor * bucket   = nullptr; // 0 = hot, 1 = cold
+// static hot/cold MoE expert placement
+struct llama_layer_moe_placement {
+    std::vector<llama_moe_bucket> buckets;          // hot buckets in device order, then the cold (CPU) bucket
+    struct ggml_tensor *          bucket = nullptr; // I32 [1, n_expert]: index in buckets of each expert
 };
 
 struct llama_layer {

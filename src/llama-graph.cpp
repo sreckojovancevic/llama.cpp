@@ -2331,53 +2331,50 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * experts = nullptr;
 
     if (moe_pl) {
-        // static hot/cold placement: run the expert FFN once per bucket with local ids, then for each slot take
-        // the row of the bucket that holds its expert (GET_ROWS, not a multiply by 0, so inf/nan rows of the
-        // other bucket cannot leak in); router weights are applied after that as in the unsplit path
+        // static placement: run the expert FFN once per bucket (hot buckets on their devices, then the cold bucket
+        // on the CPU) with local ids, then for each slot take the row of the bucket that holds its expert (GET_ROWS,
+        // not a multiply by 0, so inf/nan rows of the other buckets cannot leak in); router weights are applied after
+        // that as in the unsplit path
         GGML_ASSERT(!weight_before_ffn && !gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b);
         GGML_ASSERT(!up_exps_s && !gate_exps_s && !down_exps_s);
 
-        const bool has_hot  = moe_pl->up_hot  != nullptr;
-        const bool has_cold = moe_pl->up_cold != nullptr;
+        const int n_buckets = (int) moe_pl->buckets.size();
+        GGML_ASSERT(n_buckets > 0);
 
         ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
 
-        ggml_tensor * exp_hot  = nullptr;
-        ggml_tensor * exp_cold = nullptr;
+        ggml_tensor * stacked = nullptr; // [n_embd, b, n_expert_used*n_tokens]
+        for (int b = 0; b < n_buckets; ++b) {
+            const llama_moe_bucket & bk = moe_pl->buckets[b];
 
-        if (has_hot) {
-            ggml_tensor * ids_hot = ggml_get_rows(ctx0, moe_pl->ids_hot, ids_flat); // [1, n_expert_used*n_tokens]
-            ggml_tensor * cur_hot = cur;
-            if (has_cold) {
-                // cold slots use local expert 0 here and their rows are dropped below; this can repeat an id within
-                // a token, which CPU repack and CUDA MMQ do not support, so use one slot per row: ids [1, n_expert_used*n_tokens]
-                cur_hot = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
-                cur_hot = ggml_reshape_3d(ctx0, cur_hot, n_embd, 1, n_expert_used*n_tokens);
+            ggml_tensor * ids_b = ggml_get_rows(ctx0, bk.ids, ids_flat); // [1, n_expert_used*n_tokens]
+            ggml_tensor * cur_b = cur;
+            if (!bk.skip && n_buckets > 1) {
+                // slots of other buckets use local expert 0 here and their rows are dropped below; this can repeat an
+                // id within a token, which CPU repack and CUDA MMQ do not support, so use one slot per row:
+                // ids [1, n_expert_used*n_tokens]
+                cur_b = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+                cur_b = ggml_reshape_3d(ctx0, cur_b, n_embd, 1, n_expert_used*n_tokens);
             } else {
-                ids_hot = ggml_reshape_2d(ctx0, ids_hot, n_expert_used, n_tokens);
+                // skip flag: slots of other buckets are -1, skipped, and their rows are 0
+                ids_b = ggml_reshape_2d(ctx0, ids_b, n_expert_used, n_tokens);
             }
-            cb(ids_hot, "ffn_moe_ids_hot", il);
-            exp_hot = build_experts(cur_hot, moe_pl->up_hot, moe_pl->gate_hot, moe_pl->down_hot, nullptr, ids_hot, false);
-            cb(exp_hot, "ffn_moe_down_hot", il);
-        }
-        if (has_cold) {
-            // hot slots are -1 here and are skipped, their rows are 0
-            ggml_tensor * ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_pl->ids_cold, ids_flat), n_expert_used, n_tokens);
-            cb(ids_cold, "ffn_moe_ids_cold", il);
-            exp_cold = build_experts(cur, moe_pl->up_cold, moe_pl->gate_cold, moe_pl->down_cold, nullptr, ids_cold, has_hot);
-            cb(exp_cold, "ffn_moe_down_cold", il);
+            cb(ids_b, "ffn_moe_ids_bucket", il);
+
+            ggml_tensor * exp_b = build_experts(cur_b, bk.up, bk.gate, bk.down, nullptr, ids_b, bk.skip);
+            cb(exp_b, "ffn_moe_down_bucket", il);
+
+            exp_b   = ggml_reshape_3d(ctx0, exp_b, n_embd, 1, n_expert_used*n_tokens);
+            stacked = stacked ? ggml_concat(ctx0, stacked, exp_b, 1) : exp_b;
         }
 
-        if (has_hot && has_cold) {
-            // [n_embd, 2, n_expert_used*n_tokens]: row 0 = hot, row 1 = cold; bucket id 0/1 selects the row per slot
-            ggml_tensor * both = ggml_concat(ctx0,
-                    ggml_reshape_3d(ctx0, exp_hot,  n_embd, 1, n_expert_used*n_tokens),
-                    ggml_reshape_3d(ctx0, exp_cold, n_embd, 1, n_expert_used*n_tokens), 1);
+        if (n_buckets > 1) {
+            // bucket id of each slot selects its row of stacked
             ggml_tensor * bucket = ggml_get_rows(ctx0, moe_pl->bucket, ids_flat); // [1, n_expert_used*n_tokens]
             cb(bucket, "ffn_moe_bucket", il);
-            experts = ggml_get_rows(ctx0, both, bucket);
+            experts = ggml_get_rows(ctx0, stacked, bucket);
         } else {
-            experts = has_hot ? exp_hot : exp_cold;
+            experts = stacked;
         }
         experts = ggml_reshape_3d(ctx0, experts, n_embd, n_expert_used, n_tokens);
         cb(experts, "ffn_moe_down", il);

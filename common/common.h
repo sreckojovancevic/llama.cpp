@@ -463,7 +463,11 @@ struct common_params_moe_placement {
     std::string profile;
     int64_t     n_selections = 0;
 
-    int64_t vram_margin   = 512ll*1024*1024; // --moe-vram-margin
+    std::vector<int64_t> vram_margin = { 512ll*1024*1024 }; // --moe-vram-margin: one value, or one per --moe-devices entry
+
+    std::vector<std::string>        devices;  // --moe-devices [EXPERIMENTAL]: hot devices in fill order, empty = one hot device
+    std::vector<ggml_backend_dev_t> dev_ptrs; // resolved devices, nullptr-terminated, empty without --moe-devices
+    std::vector<int32_t>            hot_dev;  // index in devices of each hot pair
     bool    ram_pin       = false;           // --moe-ram-pin
     int64_t ram_pin_bytes = -1;              // -1 = auto
 };
