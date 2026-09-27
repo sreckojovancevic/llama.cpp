@@ -2770,6 +2770,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"--moe-placement"}, "FILE",
+        "[EXPERIMENTAL] static hot/cold MoE expert placement from a JSON file written by\n"
+        "tools/expert-trace/analyze.py --emit-placement (qwen3moe only): hot experts go to the GPU, the rest stay on the CPU",
+        [](common_params & params, const std::string & value) {
+            const json j = json::parse(read_file(value));
+            params.moe_placement = true;
+            params.moe_hot.clear();
+            const json & layers = j.at("layers");
+            for (size_t i = 0; i < layers.size(); i++) {
+                const json & layer = layers.at(i);
+                const int il = layer.at("layer").get<int>();
+                for (int e : layer.at("hot").get<std::vector<int>>()) {
+                    params.moe_hot.push_back(il);
+                    params.moe_hot.push_back(e);
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_PLACEMENT"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

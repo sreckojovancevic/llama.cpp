@@ -49,9 +49,11 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
         // MoE branch
         const int64_t n_ff_exp = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+        if (!create_tensor_moe_placement(layer, i, n_embd, n_ff_exp, n_expert)) {
+            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+        }
     }
 }
 
@@ -148,7 +150,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     nullptr, nullptr,
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    model.layers[il].ffn_down_exps_s,
+                    nullptr,
+                    model.layers[il].moe_pl.bucket ? &model.layers[il].moe_pl : nullptr);
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 

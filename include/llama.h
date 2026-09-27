@@ -340,6 +340,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // [EXPERIMENTAL] static MoE expert placement, used when moe_placement is true (qwen3moe only)
+        // moe_hot holds n_moe_hot pairs (layer, expert) of the experts in the hot bucket, all other experts are cold
+        const int32_t * moe_hot;
+        size_t          n_moe_hot;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -347,6 +352,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool moe_placement;   // split MoE experts into hot and cold buckets, see moe_hot
     };
 
     struct llama_sampler_seq_config {

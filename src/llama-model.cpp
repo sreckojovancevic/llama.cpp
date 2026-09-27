@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-moe-placement.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1180,6 +1181,8 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    std::unique_ptr<llama_moe_placement> moe_placement;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1535,6 +1538,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         layers.resize(n_layer_all);
 
+        if (params.moe_placement) {
+            if (arch != LLM_ARCH_QWEN3MOE) {
+                throw std::runtime_error(format("moe placement is not supported for arch %s", arch_name().c_str()));
+            }
+            if (ml.files.empty()) {
+                throw std::runtime_error("moe placement needs a model file");
+            }
+            pimpl->moe_placement = std::make_unique<llama_moe_placement>(params.moe_hot, params.n_moe_hot, n_layer_all, n_expert);
+        }
+
         // call the per-model loading function
         load_arch_tensors(ml);
 
@@ -1805,6 +1818,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_buf_maps.emplace_back(ctx, buf_map);
     }
 
+    if (pimpl->moe_placement) {
+        pimpl->moe_placement->alloc(ml.no_alloc, pimpl->ctxs_bufs);
+    }
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -1839,6 +1856,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const auto & buf_map = ctx_buf_map.second;
             return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
         });
+    }
+
+    // before load_all_data, which unmaps the parts of the file it does not use
+    if (pimpl->moe_placement) {
+        pimpl->moe_placement->load(ml);
+        pimpl->moe_placement.reset();
     }
 
     // load tensor data
@@ -2772,12 +2795,15 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_hot                     =*/ nullptr,
+        /*.n_moe_hot                   =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_placement               =*/ false,
     };
 
     return result;
@@ -3230,6 +3256,41 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
     }
+}
+
+bool llama_model_base::create_tensor_moe_placement(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_) {
+    if (!pimpl->moe_placement) {
+        return false;
+    }
+
+    const auto check = [&](llm_tensor t, std::initializer_list<int64_t> ne) {
+        const std::string name = tn(t, "weight", bid).str();
+        ml->check_tensor_dims(name, ne, true, false);
+        if (ml->get_tensor_meta(tn(t, "scale", bid).str().c_str())) {
+            throw std::runtime_error(format("moe placement: expert scale tensors are not supported (layer %d)", bid));
+        }
+        return name;
+    };
+
+    const std::string name_gate = check(LLM_TENSOR_FFN_GATE_EXPS, {n_embd_, n_ff_,   n_expert_});
+    const std::string name_up   = check(LLM_TENSOR_FFN_UP_EXPS,   {n_embd_, n_ff_,   n_expert_});
+    const std::string name_down = check(LLM_TENSOR_FFN_DOWN_EXPS, {n_ff_,   n_embd_, n_expert_});
+
+    // hot bucket: the layer device if it is a GPU, else the first GPU, else the CPU
+    const buft_list_t * hot_bufts = pimpl->dev_layer.at(bid).buft_list;
+    if (ggml_backend_dev_type(pimpl->dev_layer.at(bid).dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        for (const auto & d : devices) {
+            if (pimpl->gpu_buft_list.count(d.dev)) {
+                hot_bufts = &pimpl->gpu_buft_list.at(d.dev);
+                break;
+            }
+        }
+    }
+
+    pimpl->moe_placement->create_layer(*ml, layer.moe_pl, bid, name_gate, name_up, name_down,
+            *hot_bufts, pimpl->cpu_buft_list, ggml_backend_cpu_buffer_type());
+
+    return true;
 }
 
 void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,

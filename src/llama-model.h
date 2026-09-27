@@ -251,6 +251,22 @@ struct llama_layer_switch_lora {
     struct ggml_tensor * b_down = nullptr;
 };
 
+// static hot/cold MoE expert placement (llama_model_params::moe_placement)
+struct llama_layer_moe_placement {
+    // expert slices, nullptr when the bucket is empty
+    struct ggml_tensor * gate_hot  = nullptr;
+    struct ggml_tensor * up_hot    = nullptr;
+    struct ggml_tensor * down_hot  = nullptr;
+    struct ggml_tensor * gate_cold = nullptr;
+    struct ggml_tensor * up_cold   = nullptr;
+    struct ggml_tensor * down_cold = nullptr;
+
+    // global expert id -> local id, I32 [1, n_expert]
+    struct ggml_tensor * ids_hot  = nullptr; // local id in hot bucket, 0 for cold experts
+    struct ggml_tensor * ids_cold = nullptr; // local id in cold bucket, -1 for hot experts
+    struct ggml_tensor * bucket   = nullptr; // 0 = hot, 1 = cold
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -344,6 +360,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
+
+    // set instead of ffn_{gate,up,down}_exps when the MoE placement is used
+    struct llama_layer_moe_placement moe_pl;
 
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
@@ -805,6 +824,10 @@ struct llama_model_base : public llama_model {
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
+
+    // helper: with llama_model_params::moe_placement, create layer.moe_pl instead of the merged expert tensors
+    // returns false when the placement is not used
+    bool create_tensor_moe_placement(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,

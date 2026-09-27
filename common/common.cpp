@@ -1707,6 +1707,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
+    mparams.moe_placement = params.moe_placement;
+    mparams.moe_hot       = params.moe_hot.data();
+    mparams.n_moe_hot     = params.moe_hot.size() / 2;
+
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
