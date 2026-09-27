@@ -445,6 +445,29 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// one expert of a ranking file (analyze.py --emit-ranking)
+struct common_moe_expert_rank {
+    int32_t layer;
+    int32_t id;
+    int64_t count; // selections in the profile
+    int64_t bytes; // gate + up + down
+};
+
+struct common_params_moe_placement {
+    bool enabled = false;
+
+    std::vector<int32_t> hot;  // pairs (layer, expert): from a hot-set file, or computed from a ranking at load
+    std::vector<int32_t> warm; // pairs (layer, expert) locked in RAM, computed from a ranking with ram_pin
+
+    std::vector<common_moe_expert_rank> ranking; // non-empty for a ranking file
+    std::string profile;
+    int64_t     n_selections = 0;
+
+    int64_t vram_margin   = 512ll*1024*1024; // --moe-vram-margin
+    bool    ram_pin       = false;           // --moe-ram-pin
+    int64_t ram_pin_bytes = -1;              // -1 = auto
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -526,8 +549,7 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
-    bool                 moe_placement = false; // static hot/cold MoE expert placement (--moe-placement)
-    std::vector<int32_t> moe_hot;               // pairs (layer, expert) in the hot bucket
+    common_params_moe_placement moe; // static hot/cold MoE expert placement (--moe-placement), see moe-placement.h
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale

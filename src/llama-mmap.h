@@ -69,6 +69,9 @@ struct llama_mlock {
     void init(void * ptr);
     void grow_to(size_t target_size);
 
+    // true if a lock call failed (a warning was logged)
+    bool failed() const;
+
     static const bool SUPPORTED;
 
 private:

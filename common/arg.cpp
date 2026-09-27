@@ -8,6 +8,7 @@
 #include "json.h"
 #include "llama.h"
 #include "log.h"
+#include "moe-placement.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
@@ -2771,23 +2772,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
         {"--moe-placement"}, "FILE",
-        "[EXPERIMENTAL] static hot/cold MoE expert placement from a JSON file written by\n"
-        "tools/expert-trace/analyze.py --emit-placement (qwen3moe only): hot experts go to the GPU, the rest stay on the CPU",
+        "[EXPERIMENTAL] static hot/cold MoE expert placement (qwen3moe only) from a JSON file written by\n"
+        "tools/expert-trace/analyze.py: --emit-placement (fixed hot set) or --emit-ranking (the hot set is\n"
+        "chosen at load to fill the free VRAM); hot experts go to the GPU, the rest stay on the CPU",
         [](common_params & params, const std::string & value) {
-            const json j = json::parse(read_file(value));
-            params.moe_placement = true;
-            params.moe_hot.clear();
-            const json & layers = j.at("layers");
-            for (size_t i = 0; i < layers.size(); i++) {
-                const json & layer = layers.at(i);
-                const int il = layer.at("layer").get<int>();
-                for (int e : layer.at("hot").get<std::vector<int>>()) {
-                    params.moe_hot.push_back(il);
-                    params.moe_hot.push_back(e);
-                }
-            }
+            common_moe_placement_load_file(value, params.moe);
         }
     ).set_env("LLAMA_ARG_MOE_PLACEMENT"));
+    add_opt(common_arg(
+        {"--moe-vram-margin"}, "SIZE",
+        string_format("VRAM to leave free when --moe-placement uses a ranking, e.g. 512M, 1G (default: %lldM)", (long long) (params.moe.vram_margin >> 20)),
+        [](common_params & params, const std::string & value) {
+            params.moe.vram_margin = common_parse_size(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_VRAM_MARGIN"));
+    add_opt(common_arg(
+        {"--moe-ram-pin"}, "SIZE|auto",
+        "with a --moe-placement ranking: lock the next-hottest cold experts in RAM up to SIZE (auto: available RAM\n"
+        "minus the other host memory of the model and 2G); the other cold experts are left to the mmap of the file",
+        [](common_params & params, const std::string & value) {
+            params.moe.ram_pin       = true;
+            params.moe.ram_pin_bytes = value == "auto" ? -1 : common_parse_size(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_RAM_PIN"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

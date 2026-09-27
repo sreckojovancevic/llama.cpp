@@ -5,6 +5,7 @@
 #include "common.h"
 #include "fit.h"
 #include "log.h"
+#include "moe-placement.h"
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1326,6 +1327,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    // after the fit, so the VRAM budget uses the final layer split and context size
+    common_moe_placement_resolve(params, mparams, cparams);
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
@@ -1707,9 +1711,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
-    mparams.moe_placement = params.moe_placement;
-    mparams.moe_hot       = params.moe_hot.data();
-    mparams.n_moe_hot     = params.moe_hot.size() / 2;
+    mparams.moe_placement = params.moe.enabled;
+    mparams.moe_hot       = params.moe.hot.data();
+    mparams.n_moe_hot     = params.moe.hot.size() / 2;
+    mparams.moe_ram_pin   = params.moe.ram_pin;
+    mparams.moe_warm      = params.moe.warm.data();
+    mparams.n_moe_warm    = params.moe.warm.size() / 2;
 
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;

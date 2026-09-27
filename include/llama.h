@@ -345,6 +345,10 @@ extern "C" {
         const int32_t * moe_hot;
         size_t          n_moe_hot;
 
+        // with moe_ram_pin: pairs (layer, expert) of cold experts that are locked in RAM (mlock / VirtualLock)
+        const int32_t * moe_warm;
+        size_t          n_moe_warm;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -353,6 +357,7 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
         bool moe_placement;   // split MoE experts into hot and cold buckets, see moe_hot
+        bool moe_ram_pin;     // cold experts stay in the mmap of the model file (disk tier), moe_warm experts are locked in RAM
     };
 
     struct llama_sampler_seq_config {

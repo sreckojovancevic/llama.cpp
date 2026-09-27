@@ -14,20 +14,29 @@ struct llama_layer_moe_placement;
 // static hot/cold MoE expert placement (llama_model_params::moe_placement)
 // the merged ffn_{gate,up,down}_exps tensors of a layer are not loaded; instead the hot and the cold experts are
 // read into two smaller tensors with the same row layout, plus I32 tables that map global to local expert ids
+// with moe_ram_pin the cold bucket is the merged tensor itself (mmap of the file, global ids, hot experts skipped),
+// and the moe_warm experts in it are locked in RAM
 struct llama_moe_placement {
-    llama_moe_placement(const int32_t * hot, size_t n_hot, int n_layer, int64_t n_expert);
+    llama_moe_placement(const llama_model_params & params, int n_layer, int64_t n_expert);
 
     // hot_bufts: buffer types for the hot bucket and the id tables, cold_bufts: for the cold bucket
     // cpu_buft: for the id tables when the layer has no hot experts
+    // cold_merged: gate, up, down merged tensors already created by the caller (ram pin mode), or nullptr to slice
     void create_layer(llama_model_loader & ml, llama_layer_moe_placement & pl, int il,
             const std::string & name_gate, const std::string & name_up, const std::string & name_down,
-            const buft_list_t & hot_bufts, const buft_list_t & cold_bufts, ggml_backend_buffer_type_t cpu_buft);
+            const buft_list_t & hot_bufts, const buft_list_t & cold_bufts, ggml_backend_buffer_type_t cpu_buft,
+            ggml_tensor * const * cold_merged);
 
     // allocate the tensors created above; with no_alloc use dummy buffers
     void alloc(bool no_alloc, std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs);
 
     // copy the expert slices from the model file; must run before llama_model_loader::load_all_data unmaps the file
     void load(llama_model_loader & ml);
+
+    // lock the moe_warm experts in RAM; after all tensor data is loaded
+    void lock(llama_mlocks & mlocks);
+
+    bool ram_pin() const { return ram_pin_; }
 
 private:
     ggml_context * ctx_for_buft(ggml_backend_buffer_type_t buft);
@@ -36,6 +45,7 @@ private:
         ggml_tensor *        dst;
         std::string          src;
         std::vector<int32_t> experts; // global id of each local expert
+        bool                 unmap;   // the merged source tensor is not used after this
     };
 
     struct table {
@@ -43,12 +53,30 @@ private:
         std::vector<int32_t> data;
     };
 
+    // a run of experts of a cold tensor to lock
+    struct lock_range {
+        const ggml_tensor * t;
+        int64_t             first;
+        int64_t             n;
+    };
+
     int64_t n_expert;
+    bool    ram_pin_;
 
-    std::vector<std::vector<bool>> is_hot; // [n_layer][n_expert]
+    std::vector<std::vector<bool>> is_hot;  // [n_layer][n_expert]
+    std::vector<std::vector<bool>> is_warm; // [n_layer][n_expert]
 
-    std::vector<slice> slices;
-    std::vector<table> tables;
+    std::vector<slice>      slices;
+    std::vector<table>      tables;
+    std::vector<lock_range> locks;
+
+    // summary
+    size_t n_hot   = 0;
+    size_t n_cold  = 0;
+    size_t n_warm  = 0;
+    size_t b_hot   = 0;
+    size_t b_cold  = 0;
+    size_t b_warm  = 0;
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctxs;
     size_t max_tensors;

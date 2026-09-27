@@ -59,16 +59,32 @@ static ggml_backend_buffer_type_t select_table_buft(const buft_list_t & bufts, i
     return nullptr;
 }
 
-llama_moe_placement::llama_moe_placement(const int32_t * hot, size_t n_hot, int n_layer, int64_t n_expert)
-    : n_expert(n_expert), is_hot(n_layer, std::vector<bool>(n_expert, false)), max_tensors((size_t) n_layer*9 + 1) {
-    for (size_t i = 0; i < n_hot; ++i) {
-        const int32_t il = hot[2*i + 0];
-        const int32_t ie = hot[2*i + 1];
-        if (il < 0 || il >= n_layer || ie < 0 || ie >= n_expert) {
-            throw std::runtime_error(format("moe placement: invalid (layer, expert) = (%d, %d), model has %d layers and %d experts",
-                        il, ie, n_layer, (int) n_expert));
+llama_moe_placement::llama_moe_placement(const llama_model_params & params, int n_layer, int64_t n_expert)
+    : n_expert(n_expert), ram_pin_(params.moe_ram_pin),
+      is_hot (n_layer, std::vector<bool>(n_expert, false)),
+      is_warm(n_layer, std::vector<bool>(n_expert, false)),
+      max_tensors((size_t) n_layer*9 + 1) {
+    auto parse = [&](const int32_t * pairs, size_t n, std::vector<std::vector<bool>> & dst, const char * what) {
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t il = pairs[2*i + 0];
+            const int32_t ie = pairs[2*i + 1];
+            if (il < 0 || il >= n_layer || ie < 0 || ie >= n_expert) {
+                throw std::runtime_error(format("moe placement: invalid %s (layer, expert) = (%d, %d), model has %d layers and %d experts",
+                            what, il, ie, n_layer, (int) n_expert));
+            }
+            dst[il][ie] = true;
         }
-        is_hot[il][ie] = true;
+    };
+    parse(params.moe_hot, params.n_moe_hot, is_hot, "hot");
+    if (ram_pin_) {
+        parse(params.moe_warm, params.n_moe_warm, is_warm, "warm");
+    }
+    for (int il = 0; il < n_layer; ++il) {
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (is_hot[il][e] && is_warm[il][e]) {
+                throw std::runtime_error(format("moe placement: expert %d of layer %d is both hot and warm", (int) e, il));
+            }
+        }
     }
 }
 
@@ -92,7 +108,8 @@ ggml_context * llama_moe_placement::ctx_for_buft(ggml_backend_buffer_type_t buft
 
 void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_placement & pl, int il,
         const std::string & name_gate, const std::string & name_up, const std::string & name_down,
-        const buft_list_t & hot_bufts, const buft_list_t & cold_bufts, ggml_backend_buffer_type_t cpu_buft) {
+        const buft_list_t & hot_bufts, const buft_list_t & cold_bufts, ggml_backend_buffer_type_t cpu_buft,
+        ggml_tensor * const * cold_merged) {
     std::vector<int32_t> hot_ids;
     std::vector<int32_t> cold_ids;
 
@@ -108,7 +125,7 @@ void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_
             hot_ids.push_back(e);
         } else {
             ids_hot [e] = 0;
-            ids_cold[e] = (int32_t) cold_ids.size();
+            ids_cold[e] = cold_merged ? e : (int32_t) cold_ids.size();
             bucket  [e] = 1;
             cold_ids.push_back(e);
         }
@@ -117,14 +134,17 @@ void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_
     // the cold bucket skips the hot experts only when both buckets are used
     const bool cold_skip = !hot_ids.empty();
 
-    auto make = [&](const std::string & name, ggml_tensor ** hot, ggml_tensor ** cold) {
+    auto make = [&](const std::string & name, ggml_tensor ** hot, ggml_tensor ** cold, ggml_tensor * merged) {
         const ggml_tensor * meta = ml.require_tensor_meta(name);
         if (meta->ne[2] != n_expert || meta->ne[3] != 1) {
             throw std::runtime_error(format("moe placement: tensor '%s' has unexpected shape", name.c_str()));
         }
 
-        ml.n_created++;
-        ml.size_data -= ggml_nbytes(meta);
+        // a merged tensor created by the caller is counted by the loader
+        if (!merged) {
+            ml.n_created++;
+            ml.size_data -= ggml_nbytes(meta);
+        }
 
         auto add = [&](const std::vector<int32_t> & experts, const char * suffix, const buft_list_t & bufts, bool skip) -> ggml_tensor * {
             if (experts.empty()) {
@@ -145,17 +165,45 @@ void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_
             }
             ggml_tensor * t = ggml_dup_tensor(ctx_for_buft(buft), &t_meta);
             ggml_format_name(t, "%s.%s", name.c_str(), suffix);
-            slices.push_back({ t, name, experts });
+            slices.push_back({ t, name, experts, merged == nullptr });
             return t;
         };
 
-        *hot  = add(hot_ids,  "hot",  hot_bufts,  false);
-        *cold = add(cold_ids, "cold", cold_bufts, cold_skip);
+        *hot  = add(hot_ids, "hot", hot_bufts, false);
+        *cold = merged ? (cold_ids.empty() ? nullptr : merged) : add(cold_ids, "cold", cold_bufts, cold_skip);
+
+        const size_t nb2 = meta->nb[2];
+        b_hot  += hot_ids.size()*nb2;
+        b_cold += cold_ids.size()*nb2;
+
+        // warm experts: runs of consecutive local ids in the cold tensor
+        if (*cold) {
+            for (size_t j = 0; j < cold_ids.size(); ) {
+                if (!is_warm[il][cold_ids[j]]) {
+                    j++;
+                    continue;
+                }
+                const int64_t first = ids_cold[cold_ids[j]];
+                int64_t n = 0;
+                while (j < cold_ids.size() && is_warm[il][cold_ids[j]] && ids_cold[cold_ids[j]] == first + n) {
+                    b_warm += nb2;
+                    n++;
+                    j++;
+                }
+                locks.push_back({ *cold, first, n });
+            }
+        }
     };
 
-    make(name_gate, &pl.gate_hot, &pl.gate_cold);
-    make(name_up,   &pl.up_hot,   &pl.up_cold);
-    make(name_down, &pl.down_hot, &pl.down_cold);
+    make(name_gate, &pl.gate_hot, &pl.gate_cold, cold_merged ? cold_merged[0] : nullptr);
+    make(name_up,   &pl.up_hot,   &pl.up_cold,   cold_merged ? cold_merged[1] : nullptr);
+    make(name_down, &pl.down_hot, &pl.down_cold, cold_merged ? cold_merged[2] : nullptr);
+
+    n_hot  += hot_ids.size();
+    n_cold += cold_ids.size();
+    for (int32_t e : cold_ids) {
+        n_warm += is_warm[il][e] ? 1 : 0;
+    }
 
     // id tables next to the hot bucket (where the router runs when the layer is on the GPU), so the id mapping
     // adds no graph split; without hot experts the cold bucket uses them on the CPU
@@ -222,11 +270,11 @@ void llama_moe_placement::load(llama_model_loader & ml) {
         ggml_backend_tensor_set(s.dst, data.data(), 0, data.size());
     }
 
-    // release the pages of the merged tensors, they are not used after this
+    // release the pages of the merged tensors that are not used after this
     if (ml.use_mmap) {
         std::set<std::string> done;
         for (const auto & s : slices) {
-            if (done.insert(s.src).second) {
+            if (s.unmap && done.insert(s.src).second) {
                 ml.unmap_weight(ml.require_weight(s.src.c_str()));
             }
         }
@@ -238,4 +286,53 @@ void llama_moe_placement::load(llama_model_loader & ml) {
 
     slices.clear();
     tables.clear();
+
+    LLAMA_LOG_INFO("%s: moe placement: hot %zu experts (%.2f MiB), cold %zu experts (%.2f MiB, %s)\n", __func__,
+            n_hot, b_hot/1024.0/1024.0, n_cold, b_cold/1024.0/1024.0,
+            ram_pin_ ? (ml.use_mmap ? "in the file mapping" : "copied, no mmap") : "copied");
+}
+
+void llama_moe_placement::lock(llama_mlocks & mlocks) {
+    if (!ram_pin_) {
+        return;
+    }
+
+    // page size or a multiple of it on all platforms
+    constexpr uintptr_t align = 65536;
+
+    size_t locked = 0;
+    bool   failed = false;
+
+    for (const auto & r : locks) {
+        if (failed) {
+            break;
+        }
+        GGML_ASSERT(r.t->buffer && ggml_backend_buffer_is_host(r.t->buffer));
+        const uintptr_t p    = (uintptr_t) r.t->data + (uintptr_t) (r.first*r.t->nb[2]);
+        const uintptr_t base = p & ~(align - 1);
+        const size_t    len  = (size_t) (p - base) + (size_t) (r.n*r.t->nb[2]);
+
+        auto m = std::make_unique<llama_mlock>();
+        m->init((void *) base);
+        m->grow_to(len);
+        if (m->failed()) {
+            failed = true;
+        } else {
+            locked += (size_t) (r.n*r.t->nb[2]);
+        }
+        mlocks.push_back(std::move(m));
+    }
+
+    if (!llama_mlock::SUPPORTED) {
+        LLAMA_LOG_WARN("%s: moe placement: RAM pin requested, but locking memory is not supported on this system\n", __func__);
+        return;
+    }
+    if (failed) {
+        LLAMA_LOG_WARN("%s: moe placement: RAM tier %zu experts, %.2f MiB requested, only %.2f MiB locked - locking FAILED (see the warning above), the rest is left to the OS\n", __func__,
+                n_warm, b_warm/1024.0/1024.0, locked/1024.0/1024.0);
+    } else {
+        LLAMA_LOG_INFO("%s: moe placement: RAM tier %zu experts, %.2f MiB requested, %.2f MiB locked in %zu ranges\n", __func__,
+                n_warm, b_warm/1024.0/1024.0, locked/1024.0/1024.0, locks.size());
+    }
+    locks.clear();
 }

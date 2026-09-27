@@ -1545,7 +1545,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (ml.files.empty()) {
                 throw std::runtime_error("moe placement needs a model file");
             }
-            pimpl->moe_placement = std::make_unique<llama_moe_placement>(params.moe_hot, params.n_moe_hot, n_layer_all, n_expert);
+            pimpl->moe_placement = std::make_unique<llama_moe_placement>(params, n_layer_all, n_expert);
         }
 
         // call the per-model loading function
@@ -1861,7 +1861,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // before load_all_data, which unmaps the parts of the file it does not use
     if (pimpl->moe_placement) {
         pimpl->moe_placement->load(ml);
-        pimpl->moe_placement.reset();
     }
 
     // load tensor data
@@ -1869,6 +1868,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    if (pimpl->moe_placement) {
+        pimpl->moe_placement->lock(pimpl->mlock_bufs);
+        pimpl->moe_placement.reset();
     }
 
     if (use_mmap_buffer) {
@@ -2797,6 +2801,8 @@ llama_model_params llama_model_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.moe_hot                     =*/ nullptr,
         /*.n_moe_hot                   =*/ 0,
+        /*.moe_warm                    =*/ nullptr,
+        /*.n_moe_warm                  =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
@@ -2804,6 +2810,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.moe_placement               =*/ false,
+        /*.moe_ram_pin                 =*/ false,
     };
 
     return result;
@@ -3287,8 +3294,18 @@ bool llama_model_base::create_tensor_moe_placement(llama_layer & layer, int bid,
         }
     }
 
+    // RAM pin with mmap: the cold bucket is the merged tensor in the file mapping (plain CPU buffer, not repacked)
+    ggml_tensor * merged[3] = { nullptr, nullptr, nullptr };
+    if (pimpl->moe_placement->ram_pin() && ml->use_mmap) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        const buft_list_t cpu_only = { { cpu_dev, ggml_backend_dev_buffer_type(cpu_dev) } };
+        merged[0] = ml->create_tensor(hparams, &cpu_only, &cpu_only, &cpu_only, &cpu_only, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_,   n_expert_}, 0);
+        merged[1] = ml->create_tensor(hparams, &cpu_only, &cpu_only, &cpu_only, &cpu_only, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_,   n_expert_}, 0);
+        merged[2] = ml->create_tensor(hparams, &cpu_only, &cpu_only, &cpu_only, &cpu_only, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", bid), {n_ff_,   n_embd_, n_expert_}, 0);
+    }
+
     pimpl->moe_placement->create_layer(*ml, layer.moe_pl, bid, name_gate, name_up, name_down,
-            *hot_bufts, pimpl->cpu_buft_list, ggml_backend_cpu_buffer_type());
+            *hot_bufts, pimpl->cpu_buft_list, ggml_backend_cpu_buffer_type(), merged[0] ? merged : nullptr);
 
     return true;
 }

@@ -91,6 +91,8 @@ add_library(${TARGET}
     llguidance.cpp
     log.cpp
     log.h
+    moe-placement.cpp
+    moe-placement.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp
