@@ -106,6 +106,8 @@ python3 tools/expert-trace/compare-logits.py --llama-debug build/bin/llama-debug
 
 Runs that use other kernels (hot experts on the GPU) are not bit-exact; judge them with `llama-perplexity --kl-divergence` over many tokens (see `WEIGHT_PROVIDER.md`, Task 3, "Measurement sequence").
 
+`regress-placement.py` builds a tiny 48-layer qwen3moe and checks that a hot-set and a ranking placement give exact logits (`-- --rpc host:port -ngl 99` to put the hot bucket on a device). `measure-windows.ps1` runs the whole measurement sequence unattended on Windows and writes `results\moe-<date>\summary.md`.
+
 ## Sample
 
 `sample/` has two traces (`text.csv`, `code.csv`) from a tiny random-weight llama-arch MoE (6 layers, 16 experts, top-4, Q8_0 experts). They only exercise the tool and the analysis. The routing distribution of a random model says nothing about real models.

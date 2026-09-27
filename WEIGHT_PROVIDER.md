@@ -237,6 +237,14 @@ Expected tolerance:
 
 ### Measurement sequence (owner machine: RTX 2060 Super 8 GB, 32 GB RAM, Qwen3-30B-A3B Q4_K_M)
 
+Unattended: `powershell -ExecutionPolicy Bypass -File tools\expert-trace\measure-windows.ps1` runs the steps below with the paths of the owner machine (model `D:\AInode2\models\Qwen3-30B-A3B-Q4_K_M.gguf`, binaries `build\bin\Release`, traces `tr_sr_pravni.csv`, `trace_sr.csv`, `trace_code.csv` with their `.json` sidecars in the repo root; all are parameters):
+
+- aborts if free RAM is under 20 GB (`-MinFreeRamGB`), after printing free RAM and page file use;
+- placements 3G / 5G / ranking, correctness (exact all-cold vs `--cpu-moe` plus a report of the others, then KLD on wikitext-2, downloaded if missing), `llama-batched-bench` for `--n-cpu-moe 48`, `--n-cpu-moe 40`, the 3G and 5G hot sets and the ranking with `--moe-vram-margin 1G` at `-c 4096` (`-Repeats`, default 3), real-text decode with `llama-completion` (code prompt from `src/llama-sampler.cpp`; text prompt `heldout_sr.txt` in the repo root if present, else a part of README.md), one `-v` run per configuration for the buffer sizes, and `llama-bench -ncmoe 48,44,40,36` with `-fa off,on` for f16 KV and `-fa on` for q8_0 KV (a quantized V cache needs flash attention);
+- every step logs to `results\moe-<date>\NN-<step>.log` with start and end time, `steps.log` has the timeline, a failed step is recorded and the script goes on; `summary.md` has the step table, compare-logits result, KLD table, batched-bench medians, decode speeds, placement reports with buffer sizes and the llama-bench tables.
+
+Tested with PowerShell 7.4 on Linux against the Linux binaries and the tiny model (`Get-CimInstance` mocked), including the RAM abort; not run on Windows PowerShell 5.1 or on the real model. The script is written for 5.1 (no PowerShell 7 syntax).
+
 Paths are written POSIX style; on Windows the binaries are in `build\bin\Release\` and Python is `python`. `M` is the model file, the same file for trace, placement and runs (expert ids and bytes come from it). Keep all runs at the same `-c` and threads (`-t` = physical cores).
 
 1. Build: `cmake -B build -DGGML_CUDA=ON` and `cmake --build build --config Release -j`.
