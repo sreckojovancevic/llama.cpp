@@ -12,6 +12,8 @@
 #include "llama-kv-cache-dsa-iswa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
+
+#include <cstdlib>
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -2343,13 +2345,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
 
+        // the skip flag keeps the cold bucket on the CPU; at batches where a GPU backend would offload a CPU MUL_MAT_ID
+        // (as with --cpu-moe; CUDA: GGML_OP_OFFLOAD_MIN_BATCH, default 32) run it unflagged instead, so it can be offloaded
+        static const int64_t offload_min_batch = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoll(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+        const bool cold_unflagged = cparams.op_offload && n_tokens >= offload_min_batch;
+
         ggml_tensor * stacked = nullptr; // [n_embd, b, n_expert_used*n_tokens]
         for (int b = 0; b < n_buckets; ++b) {
             const llama_moe_bucket & bk = moe_pl->buckets[b];
+            const bool skip = bk.skip && !(cold_unflagged && bk.ids0);
 
-            ggml_tensor * ids_b = ggml_get_rows(ctx0, bk.ids, ids_flat); // [1, n_expert_used*n_tokens]
+            ggml_tensor * ids_b = ggml_get_rows(ctx0, skip || !bk.skip ? bk.ids : bk.ids0, ids_flat); // [1, n_expert_used*n_tokens]
             ggml_tensor * cur_b = cur;
-            if (!bk.skip && n_buckets > 1) {
+            if (!skip && n_buckets > 1) {
                 // slots of other buckets use local expert 0 here and their rows are dropped below; this can repeat an
                 // id within a token, which CPU repack and CUDA MMQ do not support, so use one slot per row:
                 // ids [1, n_expert_used*n_tokens]
@@ -2361,7 +2369,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
             cb(ids_b, "ffn_moe_ids_bucket", il);
 
-            ggml_tensor * exp_b = build_experts(cur_b, bk.up, bk.gate, bk.down, nullptr, ids_b, bk.skip);
+            ggml_tensor * exp_b = build_experts(cur_b, bk.up, bk.gate, bk.down, nullptr, ids_b, skip);
             cb(exp_b, "ffn_moe_down_bucket", il);
 
             exp_b   = ggml_reshape_3d(ctx0, exp_b, n_embd, 1, n_expert_used*n_tokens);

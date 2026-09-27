@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <cstring>
 #include <set>
 #include <stdexcept>
@@ -74,7 +75,7 @@ llama_moe_placement::llama_moe_placement(const llama_model_params & params, int 
             throw std::runtime_error("moe placement: moe_devices is empty");
         }
     }
-    max_tensors = (size_t) n_layer*(4*(n_slots + 1) + 1) + 1;
+    max_tensors = (size_t) n_layer*(4*(n_slots + 1) + 2) + 1;
     slot_n    .assign(n_slots, 0);
     slot_bytes.assign(n_slots, 0);
     slot_buft .assign(n_slots, nullptr);
@@ -232,7 +233,15 @@ void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_
         }
 
         if (has_cold) {
-            ggml_tensor * cold = merged ? merged : add(cold_ids, "cold", cold_bufts, pl.buckets.back().skip, nullptr);
+            // only host buffer types, as the experts of --cpu-moe / --n-cpu-moe: at large batches the unflagged cold
+            // bucket is offloaded to the GPU, which needs the plain layout (not CPU_REPACK); checked with the unflagged op
+            buft_list_t cold_host;
+            for (const auto & [dev, buft] : cold_bufts) {
+                if (ggml_backend_buft_is_host(buft)) {
+                    cold_host.emplace_back(dev, buft);
+                }
+            }
+            ggml_tensor * cold = merged ? merged : add(cold_ids, "cold", cold_host, false, nullptr);
             set(pl.buckets.back(), cold);
             b_cold += cold_ids.size()*nb2;
 
@@ -290,6 +299,14 @@ void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_
         pl.buckets[b].ids = add_table(ids[b], name, table_buft_for(bucket_slot[b]));
     }
     if (has_cold) {
+        if (pl.buckets.back().skip) {
+            // for large batches the cold bucket runs unflagged (so the GPU can offload it), with 0 for the other experts
+            std::vector<int32_t> ids0 = ids.back();
+            for (auto & v : ids0) {
+                v = std::max(v, 0);
+            }
+            pl.buckets.back().ids0 = add_table(ids0, "ids_cold0", shared_table_buft(first_slot));
+        }
         pl.buckets.back().ids = add_table(ids.back(), "ids_cold", shared_table_buft(first_slot));
     }
     pl.bucket = add_table(bucket, "bucket", shared_table_buft(first_slot));

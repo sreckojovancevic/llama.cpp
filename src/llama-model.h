@@ -257,6 +257,7 @@ struct llama_moe_bucket {
     struct ggml_tensor * up   = nullptr;
     struct ggml_tensor * down = nullptr;
     struct ggml_tensor * ids  = nullptr; // I32 [1, n_expert]: global -> local id; other experts: 0 (hot bucket) or -1 (cold bucket)
+    struct ggml_tensor * ids0 = nullptr; // cold bucket with other buckets: as ids, but 0 for the other experts (unflagged form)
     bool                 skip = false;   // MUL_MAT_ID skip flag: ids < 0 are skipped (cold bucket, when the layer has other buckets)
 };
 
