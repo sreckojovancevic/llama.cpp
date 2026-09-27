@@ -46,6 +46,9 @@ python3 tools/expert-trace/analyze.py a.csv b.csv --cache-slots 8,16,32 --bandwi
 
 # decode estimate with other hardware numbers
 python3 tools/expert-trace/analyze.py a.csv b.csv --cache-slots 16,32,64 --pcie-bw 6000 --cpu-expert-gbs 25 --gpu-expert-gbs 350
+
+# write the section 4 hot set (profile A, 6 GiB budget) as a placement file
+python3 tools/expert-trace/analyze.py serbian.csv,code.csv chat.csv --vram-budget 6G --emit-placement placement.json
 ```
 
 The first positional argument is profile A, the second is test B. Each can be a comma-separated list; its traces are joined one after another.
@@ -59,6 +62,20 @@ Sections printed to stdout (PNG plots go to `--out-dir`, default `expert-trace-r
 5. Dynamic cache: per-layer LRU and LFU with K slots on B; hit rate and missed bytes per token and per decode token.
 6. Throughput bound: tokens/s = bandwidth / missed bytes per decode token, for NVMe (3000 MB/s), SATA SSD (500), HDD (150) and `--bandwidth` values.
 7. Decode estimate: tokens/s for LRU experts in VRAM (K slots per layer) vs all experts on CPU. A miss is either copied over PCIe and computed on GPU, or computed on CPU and copied to VRAM in the background. Only routed expert FFN time is counted, and compute is taken as memory bound. Inputs: `--pcie-bw` (MB/s, default 12000), `--cpu-expert-gbs` (GB/s, default 40), `--gpu-expert-gbs` (GB/s, default 400). The full list of assumptions is printed with the results.
+
+`--emit-placement <file>` writes the hot set of section 4 as JSON, one entry per MoE layer with the sorted global expert ids that go to VRAM:
+
+```json
+{
+ "model": "model.gguf", "n_expert": 128, "vram_budget": 6442450944, "bytes_used": 6431965184, "profile": "serbian.csv+code.csv",
+ "layers": [
+  {"layer": 0, "hot": [3, 17, 42]},
+  ...
+ ]
+}
+```
+
+With one trace group the profile is only the first half of each trace. To build the placement from whole traces, give a second group (any trace, it is only used as B).
 
 ## Sample
 

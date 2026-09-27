@@ -235,6 +235,7 @@ def main():
     ap.add_argument("--cpu-expert-gbs", type=float, default=40.0, help="effective CPU memory bandwidth for expert compute in GB/s (default: %(default)g)")
     ap.add_argument("--gpu-expert-gbs", type=float, default=400.0, help="effective GPU memory bandwidth for expert compute in GB/s (default: %(default)g)")
     ap.add_argument("--no-plots", action="store_true", help="do not write PNG plots")
+    ap.add_argument("--emit-placement", metavar="FILE", default=None, help="write the per-layer hot expert set of section 4 (profile A, --vram-budget) to a JSON file for --moe-placement")
     args = ap.parse_args()
 
     groups = []
@@ -396,6 +397,21 @@ def main():
     print(f"{'layer':>6} {'hot':>5} {'hit % on B':>10}")
     for li, l in enumerate(m.layers):
         print(f"{l:>6} {int(placed[li].sum()):>5} {100.0 * cB[li][placed[li]].sum() / max(cB[li].sum(), 1):>10.2f}")
+    if args.emit_placement:
+        out = {
+            "model": m.model,
+            "n_expert": nE,
+            "vram_budget": int(budget),
+            "bytes_used": int(used),
+            "profile": A.name,
+            "layers": [{"layer": l, "hot": np.flatnonzero(placed[li]).tolist()} for li, l in enumerate(m.layers)],
+        }
+        # one line per layer
+        body = json.dumps(out, indent=1).split('"layers": [')[0]
+        lines = ",\n  ".join(json.dumps(x) for x in out["layers"])
+        with open(args.emit_placement, "w") as f:
+            f.write(body + '"layers": [\n  ' + lines + "\n ]\n}\n")
+        print(f"placement written to {args.emit_placement}")
     sweep = np.linspace(0, 1, 21)
     sweep_hit = []
     for f in sweep:
