@@ -1995,20 +1995,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
     GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
 
-    // [WEIGHT_PROVIDER_INSTRUMENTATION]
-    // Record the runtime expert routing without changing execution behavior.
-    GGML_LOG_INFO("[WEIGHT_PROVIDER] MUL_MAT_ID: experts=%lld active=%lld tokens=%lld\n",
-                  (long long) ne02,
-                  (long long) n_expert_used,
-                  (long long) ne12);
-    for (int64_t i02 = 0; i02 < ne02; ++i02) {
-        if (tokens_per_expert[i02] > 0) {
-            GGML_LOG_INFO("[WEIGHT_PROVIDER] expert=%lld tokens=%lld\n",
-                          (long long) i02,
-                          (long long) tokens_per_expert[i02]);
-        }
-    }
-
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
     CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
