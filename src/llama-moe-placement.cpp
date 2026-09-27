@@ -34,6 +34,31 @@ static ggml_backend_buffer_type_t select_buft(const buft_list_t & bufts, const g
     return nullptr;
 }
 
+// first buffer type in the list that supports GET_ROWS on an I32 id table
+static ggml_backend_buffer_type_t select_table_buft(const buft_list_t & bufts, int64_t n_expert) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*4,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+
+    ggml_tensor * t   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, n_expert);
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 8*512);
+    ggml_tensor * op  = ggml_get_rows(ctx.get(), t, ids);
+
+    for (const auto & [dev, buft] : bufts) {
+        t->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
+        const bool ok = ggml_backend_dev_supports_op(dev, op);
+        ggml_backend_buffer_free(t->buffer);
+        t->buffer = nullptr;
+        if (ok) {
+            return buft;
+        }
+    }
+    return nullptr;
+}
+
 llama_moe_placement::llama_moe_placement(const int32_t * hot, size_t n_hot, int n_layer, int64_t n_expert)
     : n_expert(n_expert), is_hot(n_layer, std::vector<bool>(n_expert, false)), max_tensors((size_t) n_layer*9 + 1) {
     for (size_t i = 0; i < n_hot; ++i) {
@@ -67,7 +92,7 @@ ggml_context * llama_moe_placement::ctx_for_buft(ggml_backend_buffer_type_t buft
 
 void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_placement & pl, int il,
         const std::string & name_gate, const std::string & name_up, const std::string & name_down,
-        const buft_list_t & hot_bufts, const buft_list_t & cold_bufts, ggml_backend_buffer_type_t remap_buft) {
+        const buft_list_t & hot_bufts, const buft_list_t & cold_bufts, ggml_backend_buffer_type_t cpu_buft) {
     std::vector<int32_t> hot_ids;
     std::vector<int32_t> cold_ids;
 
@@ -113,6 +138,11 @@ void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_
             if (!buft) {
                 throw std::runtime_error(format("moe placement: no buffer type for tensor '%s'", name.c_str()));
             }
+            // as in llama_model_loader::create_tensor: no host buffer with mmap
+            ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+            if (ml.use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+                buft = cpu_buft;
+            }
             ggml_tensor * t = ggml_dup_tensor(ctx_for_buft(buft), &t_meta);
             ggml_format_name(t, "%s.%s", name.c_str(), suffix);
             slices.push_back({ t, name, experts });
@@ -127,8 +157,15 @@ void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_
     make(name_up,   &pl.up_hot,   &pl.up_cold);
     make(name_down, &pl.down_hot, &pl.down_cold);
 
+    // id tables next to the hot bucket (where the router runs when the layer is on the GPU), so the id mapping
+    // adds no graph split; without hot experts the cold bucket uses them on the CPU
+    ggml_backend_buffer_type_t table_buft = hot_ids.empty() ? nullptr : select_table_buft(hot_bufts, n_expert);
+    if (!table_buft) {
+        table_buft = cpu_buft;
+    }
+
     auto add_table = [&](std::vector<int32_t> & data, const char * name) {
-        ggml_tensor * t = ggml_new_tensor_2d(ctx_for_buft(remap_buft), GGML_TYPE_I32, 1, n_expert);
+        ggml_tensor * t = ggml_new_tensor_2d(ctx_for_buft(table_buft), GGML_TYPE_I32, 1, n_expert);
         ggml_format_name(t, "blk.%d.ffn_moe_%s", il, name);
         tables.push_back({ t, std::move(data) });
         return t;

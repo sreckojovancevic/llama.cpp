@@ -17,10 +17,11 @@ struct llama_layer_moe_placement;
 struct llama_moe_placement {
     llama_moe_placement(const int32_t * hot, size_t n_hot, int n_layer, int64_t n_expert);
 
-    // hot_bufts: buffer types for the hot bucket, cold_bufts: for the cold bucket, remap_buft: for the id tables
+    // hot_bufts: buffer types for the hot bucket and the id tables, cold_bufts: for the cold bucket
+    // cpu_buft: for the id tables when the layer has no hot experts
     void create_layer(llama_model_loader & ml, llama_layer_moe_placement & pl, int il,
             const std::string & name_gate, const std::string & name_up, const std::string & name_down,
-            const buft_list_t & hot_bufts, const buft_list_t & cold_bufts, ggml_backend_buffer_type_t remap_buft);
+            const buft_list_t & hot_bufts, const buft_list_t & cold_bufts, ggml_backend_buffer_type_t cpu_buft);
 
     // allocate the tensors created above; with no_alloc use dummy buffers
     void alloc(bool no_alloc, std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs);
