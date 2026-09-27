@@ -1,0 +1,19 @@
+{
+  "model": "tiny-random-moe.gguf",
+  "arch": "llama",
+  "n_layer": 6,
+  "n_expert": 16,
+  "n_expert_used": 4,
+  "n_layer_moe": 6,
+  "n_tokens": 132,
+  "n_ubatch": 64,
+  "n_rows": 3168,
+  "layers": [
+    {"layer": 0, "n_expert": 16, "type": "q8_0", "gate_bytes": 34816, "up_bytes": 34816, "down_bytes": 34816, "gate_up_bytes": 0, "expert_bytes": 104448},
+    {"layer": 1, "n_expert": 16, "type": "q8_0", "gate_bytes": 34816, "up_bytes": 34816, "down_bytes": 34816, "gate_up_bytes": 0, "expert_bytes": 104448},
+    {"layer": 2, "n_expert": 16, "type": "q8_0", "gate_bytes": 34816, "up_bytes": 34816, "down_bytes": 34816, "gate_up_bytes": 0, "expert_bytes": 104448},
+    {"layer": 3, "n_expert": 16, "type": "q8_0", "gate_bytes": 34816, "up_bytes": 34816, "down_bytes": 34816, "gate_up_bytes": 0, "expert_bytes": 104448},
+    {"layer": 4, "n_expert": 16, "type": "q8_0", "gate_bytes": 34816, "up_bytes": 34816, "down_bytes": 34816, "gate_up_bytes": 0, "expert_bytes": 104448},
+    {"layer": 5, "n_expert": 16, "type": "q8_0", "gate_bytes": 34816, "up_bytes": 34816, "down_bytes": 34816, "gate_up_bytes": 0, "expert_bytes": 104448}
+  ]
+}
