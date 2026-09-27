@@ -12,11 +12,11 @@
 struct llama_layer_moe_placement;
 
 // static hot/cold MoE expert placement (llama_model_params::moe_placement)
-// the merged ffn_{gate,up,down}_exps tensors of a layer are not loaded; instead the experts of each bucket (one per hot
-// device, plus the cold bucket on the CPU) are read into smaller tensors with the same row layout, plus I32 tables that
-// map global to local expert ids
-// with moe_ram_pin the cold bucket is the merged tensor itself (mmap of the file, global ids, hot experts skipped),
-// and the moe_warm experts in it are locked in RAM
+// the experts of each hot bucket (one per hot device) are read into smaller tensors with the same row layout, plus I32
+// tables that map global to local expert ids
+// with mmap the cold bucket is the merged ffn_{gate,up,down}_exps tensor itself, left in the file mapping (global ids,
+// the experts of the other buckets skipped); without mmap the cold experts are copied into a smaller tensor
+// with moe_ram_pin the moe_warm experts of the cold bucket are locked in RAM
 struct llama_moe_placement {
     llama_moe_placement(const llama_model_params & params, int n_layer, int64_t n_expert);
 
@@ -27,7 +27,7 @@ struct llama_moe_placement {
     // layer_bufts: buffer types of the layer device if it is a GPU, else nullptr; its hot bucket goes first and the cold
     // id table and the bucket table go there, so the layer needs fewer graph splits
     // cpu_buft: for the id tables when the layer has no hot experts
-    // cold_merged: gate, up, down merged tensors already created by the caller (ram pin mode), or nullptr to slice
+    // cold_merged: gate, up, down merged tensors already created by the caller (mmap), or nullptr to copy the cold experts
     void create_layer(llama_model_loader & ml, llama_layer_moe_placement & pl, int il,
             const std::string & name_gate, const std::string & name_up, const std::string & name_down,
             const std::vector<const buft_list_t *> & hot_bufts, const buft_list_t * layer_bufts,

@@ -3330,9 +3330,10 @@ bool llama_model_base::create_tensor_moe_placement(llama_layer & layer, int bid,
         hot_bufts.push_back(bufts);
     }
 
-    // RAM pin with mmap: the cold bucket is the merged tensor in the file mapping (plain CPU buffer, not repacked)
+    // with mmap the cold bucket is the merged tensor in the file mapping (plain CPU buffer, as with --n-cpu-moe), so the
+    // cold experts are not copied; without mmap (--load-mode none) they are copied
     ggml_tensor * merged[3] = { nullptr, nullptr, nullptr };
-    if (pimpl->moe_placement->ram_pin() && ml->use_mmap) {
+    if (ml->use_mmap) {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         const buft_list_t cpu_only = { { cpu_dev, ggml_backend_dev_buffer_type(cpu_dev) } };
         merged[0] = ml->create_tensor(hparams, &cpu_only, &cpu_only, &cpu_only, &cpu_only, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_,   n_expert_}, 0);

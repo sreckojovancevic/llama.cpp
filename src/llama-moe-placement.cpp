@@ -377,7 +377,7 @@ void llama_moe_placement::load(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: moe placement: hot %zu experts (%.2f MiB), cold %zu experts (%.2f MiB, %s)\n", __func__,
             n_hot, b_hot/1024.0/1024.0, n_cold, b_cold/1024.0/1024.0,
-            ram_pin_ ? (ml.use_mmap ? "in the file mapping" : "copied, no mmap") : "copied");
+            ml.use_mmap ? "in the file mapping" : "copied, no mmap");
     if (n_slots > 1) {
         for (int s = 0; s < n_slots; ++s) {
             LLAMA_LOG_INFO("%s: moe placement:   device %d (%s): %zu hot experts, %.2f MiB\n", __func__, s,
