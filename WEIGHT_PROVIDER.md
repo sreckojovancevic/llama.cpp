@@ -125,7 +125,21 @@ a `--help` and a short README section with example commands.
 
 Done when: runs on the committed sample trace and produces all six sections.
 
-Status: done. `analyze.py` runs on the sample traces and prints all six sections.
+Status: done. `analyze.py` runs on the sample traces and prints all sections (section 7, decode estimate, added after Phase 0 results).
+
+## Phase 0 results (real model)
+
+Measured by the owner: Qwen3-30B-A3B (48 MoE layers, 128 experts, top-8), RTX 2060 Super 8 GB, experts on CPU.
+
+- Within one workload routing is concentrated: 80% of selections are covered by ~26-34 experts per layer (uniform would need ~103).
+- Across workloads the hot sets are nearly disjoint: Jaccard of top-N sets is 0.04, lower than random sets (0.14).
+- LRU with 32 slots per layer gives 82-89% hits.
+
+What this means:
+
+- A static hot set from one workload does not carry over to another. Phase 1 (static, profile-guided) only helps if the profile matches the workload, or is built from a mix of workloads (`analyze.py` accepts comma-separated trace groups for this).
+- The hot set shifts between workloads, but inside one workload a small LRU cache holds most of it. This is the condition the plan gave for Phase 2 (dynamic residency).
+- Next step before any design decision: section 7 of `analyze.py` (decode tokens/s estimate, LRU in VRAM vs all on CPU) on these traces, with the real PCIe / CPU / GPU numbers of the test machine.
 
 ## Task 3 - Phase 1 design (do NOT implement until asked)
 
