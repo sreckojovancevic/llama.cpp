@@ -155,9 +155,9 @@ Pieces:
   - `ids_hot`: local id in the hot bucket, 0 for cold experts
   - `ids_cold`: local id in the cold bucket, -1 for hot experts
   - `bucket`: 0 = hot, 1 = cold
-  The expert slices are copied from the file (mmap or read) before the normal tensor load, and the pages of the merged tensors are released after that.
+  The hot expert slices are copied from the file (mmap or read) before the normal tensor load.
   - Hot bucket buffer: the layer device if it is a GPU, else the first GPU, else the CPU (first buffer type that supports MUL_MAT_ID for it).
-  - Cold bucket buffer: the CPU buffer types (CPU_REPACK is used when the type supports it). As in the normal loader, a host (pinned) buffer is replaced by the plain CPU buffer when mmap is used, so an all-cold placement uses the same buffers as `--cpu-moe`.
+  - Cold bucket (current state, see Task 7): with mmap it is the merged `ffn_*_exps` tensor itself, left in the file mapping (plain CPU buffer, like the experts of `--cpu-moe` / `--n-cpu-moe`), used with global ids and the experts of the other buckets skipped; nothing is copied. Without mmap (`--load-mode none`) the cold experts are copied into a host buffer (pinned host buffer if there is a GPU, else plain CPU). The first version copied them into CPU_REPACK.
   - Id tables: on the hot bucket's device when the layer has hot experts (first buffer type there that supports GET_ROWS on I32), else on the CPU. See "Graph splits per layer".
   - `-ot` / `--cpu-moe` / `--n-cpu-moe` do not apply to the sliced tensors. Expert scale tensors (NVFP4 `.scale`) and LoRA on expert tensors are not supported with the placement.
 - ggml: `ggml_mul_mat_id_set_skip(node, true)` (op param 4). With the flag, an id < 0 skips that slot and its dst row is set to 0. Implemented in the CPU backend (generic kernel and repack). `ggml_backend_dev_supports_op` / `ggml_backend_dev_offload_op` return false for flagged nodes on every non-CPU device; the spacemit extra buffer type also rejects them. Test: `test-backend-ops -o MUL_MAT_ID` cases with `skip=1`.
@@ -341,9 +341,8 @@ Scope: as Task 3 (qwen3moe, off by default). All of it is used only with `--moe-
    - VRAM budget on the first GPU: `free - (model - probe experts) - KV - compute - --moe-vram-margin` (default 512M). With more than one GPU only the first is budgeted (warning).
    - Greedy fill over all layers by count per byte (unseen experts last, spread over layers, as analyze.py section 4); an expert that does not fit is skipped and smaller ones can still fit.
 3. `--moe-ram-pin <size|auto>`: the next experts in the same order go to the RAM tier up to the size. `auto` = available RAM - host memory of the rest of the model (model without the cold experts, host KV, host compute, from the dry run) - 2 GiB reserve. In the loader:
-   - With mmap, the cold bucket is the merged `ffn_*_exps` tensor itself, left in the file mapping (plain CPU buffer), with global ids and the hot experts skipped. The RAM tier experts are locked in it with `llama_mlock` (mlock / VirtualLock, 64 KiB aligned runs of experts); the rest is not locked and the OS pages it in and out (disk tier). The hot experts are still copied to the GPU.
-   - Without mmap (`--load-mode none`) the cold experts are copied as before and the RAM tier is locked in that copy; there is no disk tier.
-   - Cost: the mapped cold bucket is not repacked (CPU_REPACK needs a copy), so CPU expert compute uses the plain kernels.
+   - With mmap the cold bucket is the merged `ffn_*_exps` tensor in the file mapping (since Task 7 also without `--moe-ram-pin`). The RAM tier experts are locked in it with `llama_mlock` (mlock / VirtualLock, 64 KiB aligned runs of experts); the rest is not locked and the OS pages it in and out (disk tier).
+   - Without mmap (`--load-mode none`) the cold experts are copied and the RAM tier is locked in that copy; there is no disk tier.
    - Result: `lock: moe placement: RAM tier N experts, X MiB requested, Y MiB locked in R ranges` (info, shown with `-v`), or a warning with how much was locked when a lock call failed (always shown). After the first failure no more locks are tried.
 4. Report, printed by common before the load:
    ```
@@ -355,7 +354,7 @@ Scope: as Task 3 (qwen3moe, off by default). All of it is used only with `--moe-
      RAM (pinned)       18          2.0                  22.7%
      disk (mmap)        25          2.9                  15.1%
    ```
-   Without `--moe-ram-pin` the last row is `RAM (cold)`. The share is the expected hit rate if the workload routes like the profile. The loader adds (with `-v`) `load: moe placement: hot N experts (X MiB), cold M experts (Y MiB, copied | in the file mapping | copied, no mmap)`.
+   Without `--moe-ram-pin` the last row is `RAM (cold)`. The share is the expected hit rate if the workload routes like the profile. The loader adds (with `-v`) `load: moe placement: hot N experts (X MiB), cold M experts (Y MiB, in the file mapping | copied, no mmap)`.
 
 Notes:
 
@@ -436,7 +435,7 @@ Owner results (Qwen3-30B-A3B Q4_K_M, RTX 2060 Super 8 GB): prefill with placemen
 Fix:
 
 - `build_moe_ffn`: when `n_tokens >= GGML_OP_OFFLOAD_MIN_BATCH` (default 32, the CUDA default and the same variable) and op offload is on (not `--no-op-offload`), the cold bucket runs unflagged with a second id table (`ids_cold0`: 0 instead of -1 for the experts of the other buckets) and in the one-slot-per-row form (those zeros can repeat within a token). Below that it stays flagged, as before. No weight multiply is needed: the combine takes each slot's row by bucket id, so the dummy rows are never read.
-- The cold bucket is allocated only in host buffer types, like the `--n-cpu-moe` experts: plain CPU buffer with mmap, pinned host buffer without mmap. When the scheduler offloads it, it copies only the experts used in the batch (existing logic), i.e. only cold experts, fewer bytes than `--n-cpu-moe`.
+- The cold bucket is allocated only in host buffer types, like the `--n-cpu-moe` experts: plain CPU buffer with mmap, pinned host buffer without mmap (since Task 7, with mmap it is the file mapping itself). When the scheduler offloads it, it copies only the experts used in the batch (existing logic), i.e. only cold experts, fewer bytes than `--n-cpu-moe`.
 - Cost: at decode the cold experts use the plain CPU kernels instead of repack. `llama-cold-ffn-bench` here: repack is 10-20 % faster per expert at 4 threads (474 vs 574 us for 8 experts per layer).
 - Verified here (no GPU, so the offload itself is not): switch at the threshold (a 30-token batch stays flagged, 512 unflagged, `--no-op-offload` always flagged, checked with a debug print), logits exact against the unsplit model at `-ub 512`, `16`, `1` on CPU and with the hot bucket on an RPC device, `regress-placement.py` OK. On a CPU-only machine the exact all-cold check needs `-nr` on both sides (there `--cpu-moe` uses `CPU_REPACK`); on the CUDA machine both use the plain CPU buffer.
 - The ranking's 21 t/s is lower than the hot sets' 73-110 t/s; not explained by the flag alone. To check on the machine: VRAM use against the budget line (Task Manager, "shared GPU memory": the Windows driver can spill to system RAM when VRAM is oversubscribed, which is very slow) and the new pp numbers.
@@ -470,6 +469,18 @@ New measurement tools:
 - A second, probably larger source: `llama-perplexity -c 512` runs batches of 512, where `--cpu-moe` and `--n-cpu-moe 40` offload all experts to the GPU (identical CUDA kernels, KLD ~0 between them), while the flagged cold bucket of the placements ran on the CPU (repack, q8_K activations) - a CPU-vs-GPU kernel difference for ~30 % of the expert work. The prefill fix removes both: the cold bucket is in a plain host buffer and is offloaded at batch 512 like the baseline, so the KLD of the placements should drop toward the `--n-cpu-moe 40` level.
 - Decomposition added to `measure-windows.ps1` (at `-ub 16` nothing is offloaded): `kld-cpu-vs-gpu-kernels` = `--cpu-moe -ub 16` (CPU plain kernels) against the `-c 512` reference (GPU kernels); `kld-repack-vs-plain` = `--cpu-moe --no-host -ub 16` (`CPU_REPACK`) against `--cpu-moe -ub 16`.
 - Here (CPU, random-weight 8-layer MoE with small embeddings so the softmax is not saturated): repack vs plain KLD 0.0039, but the same plain kernels at `-ub 8` vs `-ub 256` also give 0.018. On a random MoE any kernel change flips near-tied router choices, so these values say nothing about the size on Qwen3; only the measurement on the machine can rank the two causes.
+
+## Task 7 - cold bucket in the file mapping by default
+
+Since Task 6 the cold bucket has to be in a host buffer with the plain layout (for the prefill offload), so copying it had no benefit left: the kernels are the same as for the file mapping. The owner's run showed the cost of the copy: ~13.7 GB of cold experts copied into RAM for each placement run and ~50 s load, against 3-12 s for `--n-cpu-moe`, with 8.8 GB of swap already in use.
+
+- With mmap (default) the cold bucket is the merged `ffn_{gate,up,down}_exps` tensor in the file mapping, as the experts of `--n-cpu-moe`: global ids, the experts of the other buckets skipped (skip flag) or mapped to expert 0 in the unflagged large-batch form. Only the hot experts are copied (to the GPU), plus the small id tables. The pages of the hot experts in the mapping are read once for that copy and are never used again; the OS can drop them.
+- Without mmap (`--load-mode none`) the cold experts are copied into a host buffer as before.
+- `--moe-ram-pin` only adds the locking now; the disk tier (unlocked cold experts left to the OS) is the default behavior with mmap.
+- The loader line says which: `cold M experts (Y MiB, in the file mapping)` or `(Y MiB, copied, no mmap)`. With `-v` the placement buffers then hold only the id tables on the CPU side, and `CPU_Mapped` holds the cold experts.
+- Verified (CPU and RPC devices, `-nr` so all runs use the same kernels): logits exact against the unsplit model at `-ub 512`, `16`, `1` for a hot set, a ranking, a ranking with `--moe-ram-pin`, all cold, and the hot set and all cold with `--load-mode none` (copy); on one RPC device (hot set, ranking with RAM pin, copy) and on two RPC devices (`--moe-devices`, three buckets); `regress-placement.py` (48 layers) on CPU and RPC.
+- Note for CPU-only machines: `--cpu-moe` puts the experts into CPU_REPACK there (no host buffer type in the list), the placement's cold bucket uses the plain kernels, so exact checks need `-nr` on both sides. On the CUDA machine both use the plain CPU buffer of the file mapping.
+- Not verified: load time and RAM use on the owner machine (expected close to `--n-cpu-moe`), CUDA offload at prefill from the mapping.
 
 ## Coding rules
 
