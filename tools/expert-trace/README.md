@@ -77,6 +77,8 @@ Sections printed to stdout (PNG plots go to `--out-dir`, default `expert-trace-r
 
 With one trace group the profile is only the first half of each trace. To build the placement from whole traces, give a second group (any trace, it is only used as B).
 
+Load the file with `--moe-placement placement.json` (qwen3moe only, see `WEIGHT_PROVIDER.md` Task 3): the hot experts of each layer go to the GPU, the rest stay on the CPU.
+
 ## Sample
 
 `sample/` has two traces (`text.csv`, `code.csv`) from a tiny random-weight llama-arch MoE (6 layers, 16 experts, top-4, Q8_0 experts). They only exercise the tool and the analysis. The routing distribution of a random model says nothing about real models.
