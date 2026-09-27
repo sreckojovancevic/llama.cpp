@@ -8,8 +8,10 @@ Sections:
   4. static placement simulation (VRAM budget, profile A -> hit rate on B)
   5. dynamic cache simulation (per-layer LRU / LFU with K slots)
   6. throughput upper bound for the cold tier
+  7. decode tokens/s estimate: LRU experts in VRAM vs all experts on CPU
 
-With one trace, A is the first half of its tokens and B is the second half.
+A and B can each be a comma-separated list of traces; the traces of one group are concatenated.
+With one group, each trace is split: first halves of tokens go to A, second halves to B.
 """
 
 from __future__ import annotations
@@ -50,6 +52,31 @@ class Trace:
 
     def subset(self, mask, name):
         return Trace(name, self.ubatch[mask], self.layer[mask], self.token[mask], self.rank[mask], self.expert[mask], self.meta)
+
+
+def concat(traces, name):
+    """Join traces one after another; token and ubatch ids are shifted so they do not overlap."""
+    if len(traces) == 1:
+        t = traces[0]
+        return Trace(name, t.ubatch, t.layer, t.token, t.rank, t.expert, t.meta)
+    ub, lay, tok, rk, ex = [], [], [], [], []
+    ub_off = tok_off = 0
+    for t in traces:
+        ub.append(t.ubatch + ub_off)
+        tok.append(t.token + tok_off)
+        lay.append(t.layer)
+        rk.append(t.rank)
+        ex.append(t.expert)
+        ub_off += int(t.ubatch.max()) + 1
+        tok_off += int(t.token.max()) + 1
+    meta = next((t.meta for t in traces if t.meta), {})
+    return Trace(name, *(np.concatenate(x) for x in (ub, lay, tok, rk, ex)), meta)
+
+
+def split_half(t):
+    toks = t.tokens
+    cut = toks[len(toks) // 2] if len(toks) > 1 else toks[-1] + 1
+    return t.subset(t.token < cut, t.name + " [1st half]"), t.subset(t.token >= cut, t.name + " [2nd half]")
 
 
 def sidecar_path(csv_path):
@@ -175,18 +202,20 @@ def simulate_cache(streams, k, policy, eb):
 
 
 def greedy_placement(m, counts_a, budget):
-    """Pick (layer, expert) by count/bytes until budget is used. Returns bool mask [n_layer, n_expert]."""
+    """Pick (layer, expert) by count/bytes until budget is used. Returns bool mask [n_layer, n_expert] and bytes used.
+    Experts not seen in the profile fill the rest of the budget, spread over layers in turn."""
     eb = m.expert_bytes[:, None] * np.ones((1, m.n_expert))
     score = counts_a / eb
-    order = np.argsort(-score, axis=None, kind="stable")
+    # for unseen experts: n-th unseen expert of each layer comes before the (n+1)-th of any layer
+    unseen_rank = np.cumsum(counts_a == 0, axis=1) * (counts_a == 0)
+    order = np.lexsort((unseen_rank.ravel(), -score.ravel()))
     placed = np.zeros(counts_a.shape, dtype=bool)
     used = 0.0
+    limit = budget * (1 + 1e-9)
     for flat in order:
         li, e = np.unravel_index(flat, counts_a.shape)
-        if counts_a[li, e] == 0:
-            break
         b = eb[li, e]
-        if used + b > budget:
+        if used + b > limit:
             continue
         placed[li, e] = True
         used += b
@@ -195,30 +224,39 @@ def greedy_placement(m, counts_a, budget):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("traces", nargs="+", help="CSV trace(s). First = profile A, second = test B. With one trace, A/B = first/second half of tokens.")
+    ap.add_argument("traces", nargs="+", help="CSV trace groups: first = profile A, second = test B. A group can be comma-separated (a.csv,b.csv) to combine workloads. With one group, A/B = first/second half of each trace.")
     ap.add_argument("--meta", help="JSON sidecar (default: <trace>.json next to the first trace)")
     ap.add_argument("--out-dir", default="expert-trace-report", help="directory for PNG plots (default: %(default)s)")
     ap.add_argument("--top-n", type=int, default=0, help="hot set size per layer for Jaccard (default: n_expert/4)")
     ap.add_argument("--vram-budget", default=None, help="VRAM budget for expert weights, e.g. 8G, 512M, or bytes (default: 50%% of all expert bytes)")
     ap.add_argument("--cache-slots", default=None, help="comma-separated K values for LRU/LFU (default: n_used, 2*n_used, n_expert/4, n_expert/2)")
     ap.add_argument("--bandwidth", default=None, help="comma-separated extra cold-tier bandwidths in MB/s (presets always shown: nvme 3000, sata-ssd 500, hdd 150)")
+    ap.add_argument("--pcie-bw", type=float, default=12000.0, help="host to VRAM copy bandwidth in MB/s for section 7 (default: %(default)g)")
+    ap.add_argument("--cpu-expert-gbs", type=float, default=40.0, help="effective CPU memory bandwidth for expert compute in GB/s (default: %(default)g)")
+    ap.add_argument("--gpu-expert-gbs", type=float, default=400.0, help="effective GPU memory bandwidth for expert compute in GB/s (default: %(default)g)")
     ap.add_argument("--no-plots", action="store_true", help="do not write PNG plots")
     args = ap.parse_args()
 
-    traces = [load_trace(p, args.meta if i == 0 else None) for i, p in enumerate(args.traces)]
-    if len(traces) > 2:
-        print(f"note: {len(traces)} traces given; A = {traces[0].name}, B = {traces[1].name}, others only in sections 1-2")
+    groups = []
+    traces = []
+    for g in args.traces:
+        grp = []
+        for p in g.split(","):
+            grp.append(load_trace(p, args.meta if not traces else None))
+            traces.append(grp[-1])
+        groups.append(grp)
+    if len(groups) > 2:
+        print(f"note: {len(groups)} trace groups given; only the first two are used as A and B, others only in sections 1-2")
     m = Model(traces)
 
-    if len(traces) == 1:
-        t = traces[0]
-        toks = t.tokens
-        cut = toks[len(toks) // 2] if len(toks) > 1 else toks[-1] + 1
-        A = t.subset(t.token < cut, t.name + " [first half]")
-        B = t.subset(t.token >= cut, t.name + " [second half]")
-        ab_note = "single trace: A = first half of tokens, B = second half"
+    if len(groups) == 1:
+        halves = [split_half(t) for t in groups[0]]
+        A = concat([h[0] for h in halves], "+".join(h[0].name for h in halves))
+        B = concat([h[1] for h in halves], "+".join(h[1].name for h in halves))
+        ab_note = "single group: A = first half of tokens of each trace, B = second half"
     else:
-        A, B = traces[0], traces[1]
+        A = concat(groups[0], "+".join(t.name for t in groups[0]))
+        B = concat(groups[1], "+".join(t.name for t in groups[1]))
         ab_note = f"A = {A.name}, B = {B.name}"
 
     nL, nE, nU = len(m.layers), m.n_expert, m.n_expert_used
@@ -349,7 +387,7 @@ def main():
     n_tok_B = max(len(B.tokens), 1)
     dec_B = B.subset(B.decode_mask, B.name + " decode")
     miss_bytes_B = float(((~placed) * cB * m.expert_bytes[:, None]).sum())
-    print(f"placed experts: {int(placed.sum())} / {nL * nE}, bytes used {fmt_bytes(used)} ({100.0 * used / total_expert_bytes:.1f}% of all experts)")
+    print(f"placed experts: {int(placed.sum())} / {nL * nE} ({int((placed & (cA == 0)).sum())} not seen in A), bytes used {fmt_bytes(used)} ({100.0 * used / total_expert_bytes:.1f}% of all experts)")
     print(f"hit rate on B: {100.0 * hitB:.2f}%   (on A itself: {100.0 * selfA:.2f}%, uniform guess: {100.0 * used / total_expert_bytes:.2f}%)")
     if len(dec_B.expert):
         cBd = m.counts(dec_B)
@@ -442,6 +480,50 @@ def main():
         ax.set_title("cold tier throughput bound")
         ax.legend()
         save(fig, "6_throughput_bound.png")
+
+    # 7. decode speed estimate
+    pcie = args.pcie_bw * 1e6
+    cpu = args.cpu_expert_gbs * 1e9
+    gpu = args.gpu_expert_gbs * 1e9
+    print("\n== 7. Decode tokens/s estimate: LRU experts in VRAM vs all experts on CPU ==")
+    print(f"inputs: pcie {args.pcie_bw:g} MB/s, cpu expert {args.cpu_expert_gbs:g} GB/s, gpu expert {args.gpu_expert_gbs:g} GB/s")
+    print("assumptions:")
+    print("  - only routed expert FFN time is counted; attention, router, shared experts, dense layers, sync and launch overhead are ignored")
+    print("  - expert compute is memory bound: time = expert bytes / effective bandwidth of the device that runs it")
+    print("  - one decode token at a time; LRU state as in section 5 (per layer, K slots)")
+    print("  - copy:  a miss is copied over PCIe, then computed on GPU; copy and compute do not overlap")
+    print("  - cpu:   a miss is computed on CPU from RAM and copied to VRAM in the background for later tokens;")
+    print("           GPU hits and CPU misses run one after the other; token time = max(compute time, PCIe copy time)")
+    print(f"  - tokens measured: B {'decode tokens' if n_dec_B else 'all tokens (no decode tokens)'}")
+    tot_bytes = float((cT * m.expert_bytes[:, None]).sum()) / n_tok_T  # expert bytes used per token
+    t_base = tot_bytes / cpu
+    print(f"expert bytes read per token: {fmt_bytes(tot_bytes)}")
+    print("hit % = share of expert bytes served from VRAM on the measured tokens")
+    print(f"{'config':<22} {'VRAM for cache':>14} {'hit %':>7} {'copy tok/s':>11} {'cpu tok/s':>10} {'cpu PCIe %':>10} {'best vs base':>12}")
+    print(f"{'all on CPU (base)':<22} {fmt_bytes(0):>14} {'-':>7} {'-':>11} {1 / t_base:>10.1f} {'-':>10} {'1.00x':>12}")
+    speed = []
+    for k in ks:
+        miss = cache_res[(k, "lru")][idx]
+        hit = tot_bytes - miss
+        t_copy = hit / gpu + miss / pcie + miss / gpu
+        t_cmp = hit / gpu + miss / cpu
+        t_cpu = max(t_cmp, miss / pcie)
+        best = max(1 / t_copy, 1 / t_cpu)
+        speed.append((k, 1 / t_copy, 1 / t_cpu))
+        vram = float(m.expert_bytes.sum()) * k
+        print(f"{f'LRU K={k}':<22} {fmt_bytes(vram):>14} {100.0 * hit / tot_bytes:>7.2f} {1 / t_copy:>11.1f} {1 / t_cpu:>10.1f} {100.0 * (miss / pcie) / t_cpu:>10.1f} {best * t_base:>11.2f}x")
+    print(f"{'all in VRAM (ref)':<22} {fmt_bytes(total_expert_bytes):>14} {100.0:>7.2f} {gpu / tot_bytes:>11.1f} {gpu / tot_bytes:>10.1f} {'-':>10} {t_base * gpu / tot_bytes:>11.2f}x")
+    print("cpu PCIe % = background copy time as % of token time; at 100% the copies limit the speed")
+    if plots:
+        fig, ax = plots.subplots(figsize=(6, 4.5))
+        ax.plot([s[0] for s in speed], [s[1] for s in speed], "o-", label="miss: copy to VRAM")
+        ax.plot([s[0] for s in speed], [s[2] for s in speed], "o-", label="miss: compute on CPU")
+        ax.axhline(1 / t_base, color="gray", ls="--", lw=1, label="all on CPU")
+        ax.set_xlabel("K slots per layer")
+        ax.set_ylabel("decode tokens/s (expert FFN only)")
+        ax.set_title("LRU experts in VRAM")
+        ax.legend()
+        save(fig, "7_decode_estimate.png")
 
 
 if __name__ == "__main__":

@@ -32,24 +32,33 @@ Notes:
 `analyze.py` needs Python 3 with numpy and matplotlib.
 
 ```sh
-# one trace: A = first half of tokens, B = second half
+# one group: A = first half of tokens of each trace, B = second half
 python3 tools/expert-trace/analyze.py tools/expert-trace/sample/text.csv
 
 # profile on A, test on B, 4 GiB VRAM budget for expert weights
 python3 tools/expert-trace/analyze.py serbian.csv code.csv --vram-budget 4G --out-dir report
 
+# combined profile (comma-separated group) tested on a third workload
+python3 tools/expert-trace/analyze.py serbian.csv,code.csv chat.csv
+
 # custom cache sizes and an extra cold-tier bandwidth (MB/s)
 python3 tools/expert-trace/analyze.py a.csv b.csv --cache-slots 8,16,32 --bandwidth 7000
+
+# decode estimate with other hardware numbers
+python3 tools/expert-trace/analyze.py a.csv b.csv --cache-slots 16,32,64 --pcie-bw 6000 --cpu-expert-gbs 25 --gpu-expert-gbs 350
 ```
+
+The first positional argument is profile A, the second is test B. Each can be a comma-separated list; its traces are joined one after another.
 
 Sections printed to stdout (PNG plots go to `--out-dir`, default `expert-trace-report`):
 
 1. Selection histogram per expert (per layer and all layers).
 2. Coverage: experts needed per layer for 50% / 80% / 95% of selections.
 3. Stability: Jaccard of top-N hot sets per layer, A vs B (`--top-n`, default `n_expert/4`).
-4. Static placement: greedy by count/bytes over all layers from A until `--vram-budget` is used (default 50% of all expert bytes); hit rate on B, plus a budget sweep.
+4. Static placement: greedy by count/bytes over all layers from A until `--vram-budget` is used (default 50% of all expert bytes). Experts not seen in A fill the rest of the budget, so a 100% budget gives 100% hits. Hit rate on B, plus a budget sweep.
 5. Dynamic cache: per-layer LRU and LFU with K slots on B; hit rate and missed bytes per token and per decode token.
 6. Throughput bound: tokens/s = bandwidth / missed bytes per decode token, for NVMe (3000 MB/s), SATA SSD (500), HDD (150) and `--bandwidth` values.
+7. Decode estimate: tokens/s for LRU experts in VRAM (K slots per layer) vs all experts on CPU. A miss is either copied over PCIe and computed on GPU, or computed on CPU and copied to VRAM in the background. Only routed expert FFN time is counted, and compute is taken as memory bound. Inputs: `--pcie-bw` (MB/s, default 12000), `--cpu-expert-gbs` (GB/s, default 40), `--gpu-expert-gbs` (GB/s, default 400). The full list of assumptions is printed with the results.
 
 ## Sample
 
