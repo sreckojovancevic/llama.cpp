@@ -252,6 +252,7 @@ Paths are written POSIX style; on Windows the binaries are in `build\bin\Release
    ```
    python tools/expert-trace/analyze.py trace_sr.csv,trace_code.csv,trace_chat.csv trace_code.csv --no-plots --vram-budget 3G --emit-placement placement-3g.json
    python tools/expert-trace/analyze.py trace_sr.csv,trace_code.csv,trace_chat.csv trace_code.csv --no-plots --vram-budget 5G --emit-placement placement-5g.json
+   python tools/expert-trace/analyze.py trace_sr.csv,trace_code.csv,trace_chat.csv trace_code.csv --no-plots --emit-ranking ranking.json
    echo '{"layers": []}' > all-cold.json
    ```
    (Windows cmd: `echo {"layers": []} > all-cold.json`, without the single quotes.)
@@ -263,7 +264,7 @@ Paths are written POSIX style; on Windows the binaries are in `build\bin\Release
    python tools/expert-trace/compare-logits.py --llama-debug build/bin/llama-debug -m M \
        --run "ref=--cpu-moe" --run "cold=--moe-placement all-cold.json" \
        --run "noise=--n-cpu-moe 40" --run "p3=--moe-placement placement-3g.json" --run "p5=--moe-placement placement-5g.json" \
-       --exact cold -- -ngl 99 -c 4096
+       --run "rank=--moe-placement ranking.json" --exact cold -- -ngl 99 -c 4096
    ```
    Expected: `cold` exact (result OK); `noise`, `p3`, `p5` reported with the same top-1 and small diffs. A single prompt can show one larger diff from a flipped router choice, so the decision is made in b.
    b. KL-divergence on wikitext-2 (`scripts/get-wikitext-2.sh`, or download `wikitext-2-raw-v1.zip` from `huggingface.co/datasets/ggml-org/ci` and use `wiki.test.raw`):
@@ -272,6 +273,7 @@ Paths are written POSIX style; on Windows the binaries are in `build\bin\Release
    llama-perplexity -m M -ngl 99 -f wiki.test.raw -c 512 --chunks 40 --n-cpu-moe 40                      --kl-divergence-base ref.kld --kl-divergence
    llama-perplexity -m M -ngl 99 -f wiki.test.raw -c 512 --chunks 40 --moe-placement placement-3g.json --kl-divergence-base ref.kld --kl-divergence
    llama-perplexity -m M -ngl 99 -f wiki.test.raw -c 512 --chunks 40 --moe-placement placement-5g.json --kl-divergence-base ref.kld --kl-divergence
+   llama-perplexity -m M -ngl 99 -f wiki.test.raw -c 512 --chunks 40 --moe-placement ranking.json      --kl-divergence-base ref.kld --kl-divergence
    ```
    Record `Mean KLD`, `99.9% KLD`, `Same top p` and `Mean PPL(Q)/PPL(base)` of each. Pass: the placements are within the tolerance above, relative to the `--n-cpu-moe 40` run. This covers the prefill path (batches of 512); a. covers `-ub 1`.
    Also check the load log: `moe placement buffer size` lines show the hot bytes in `CUDA0` and the cold bytes in `CPU_REPACK`/`CPU`. If 5G does not fit in VRAM with `-c 4096`, use 4.5G.
@@ -290,7 +292,14 @@ Paths are written POSIX style; on Windows the binaries are in `build\bin\Release
    ```
    Record `prompt eval time` (t/s) and `eval time` (t/s) from the perf lines at the end.
 
-6. Write the numbers into this file: VRAM used (model + placement + compute buffers from the load log), pp and tg for each configuration, the hit rates from step 3, and the KLD results from step 4.
+   Load-time budget (Task 4), same two tools, with `-c 4096` (the budget subtracts the KV cache of the actual context):
+   ```
+   llama-batched-bench -m M -ngl 99 -c 4096 -npp 512 -ntg 128 -npl 1 --moe-placement ranking.json
+   llama-batched-bench -m M -ngl 99 -c 4096 -npp 512 -ntg 128 -npl 1 --moe-placement ranking.json --moe-ram-pin auto
+   ```
+   Copy the `moe placement from ranking` report (budget line and tier table) from the log. Check that the run did not fail with out-of-memory; if it did, raise `--moe-vram-margin` (e.g. 1G) and note the value. The `--moe-ram-pin` run uses the file mapping for the cold bucket (no CPU_REPACK), so compare it with the ranking run without it: the difference is the cost of the plain CPU kernels. With `-v`, the `lock: moe placement: RAM tier ...` line says how much was locked; on Windows a failed `VirtualLock` is printed as a warning.
+
+6. Write the numbers into this file: VRAM used (model + placement + compute buffers from the load log), pp and tg for each configuration, the hit rates from step 3, the KLD results from step 4, and the ranking report (budget and tiers).
 
 ### Expected costs to check in the numbers
 
@@ -303,6 +312,64 @@ Open questions:
 - If pp512 regresses a lot: allow offload of flagged nodes to a backend that implements the skip (CUDA support for the flag), or drop the flag for large batches.
 - Overlap of the GPU and CPU buckets needs changes in the scheduler.
 - Whether the repack row map should be fixed for duplicate ids per token instead of the one-slot-per-row workaround (upstream code, not changed here).
+
+## Task 4 - load-time VRAM budget and RAM tier
+
+Scope: as Task 3 (qwen3moe, off by default). All of it is used only with `--moe-placement <ranking.json>`.
+
+### Reuse check (done before writing code)
+
+- `common_fit_params` (`--fit`, on by default) changes `-ngl`, the tensor split, per-layer expert overrides (`-ot` style) and `n_ctx` when they are left at their defaults. It does not pick single experts, so it cannot make the hot set. The ranking budget runs after it, on the final `mparams` / `cparams`, so the fit decides the layer split and the context first.
+- `common_get_device_memory_data` (common/fit.h) loads the model and a context with `no_alloc` and returns per device the free memory and the model, context (KV) and compute buffer bytes; the compute buffers are measured by the graph reserve of that context. This is exactly what the budget needs, so it is reused as is; no new estimator.
+- The CPU device reports free = total on Linux ("ill-defined"), so the RAM budget reads `MemAvailable` from `/proc/meminfo`; on Windows it uses min(available physical, available commit).
+- colibri (github.com/JustVugg/colibri, `c/resource_plan.py`), read for ideas only, no code taken: it sizes the tiers with fixed overhead constants (runtime 1.2 + 2.5 GB, 2 GB GPU reserve, RAM budget 88 % of available) and prices experts per layer uniformly, without locking. Taken over as ideas: on Windows the commit limit matters as much as free physical memory (colibri hit it), and a fixed reserve for the rest of the system. Different here: overheads are measured by a dry run instead of constants, experts are chosen one by one by count per byte, and the RAM tier is locked.
+
+### What it does
+
+1. `analyze.py --emit-ranking ranking.json`: every expert of every layer with its selection count in profile A and its bytes.
+2. `--moe-placement ranking.json` (the file format is detected: layers with `"experts"` are a ranking, layers with `"hot"` a fixed hot set). In `common_init_result`, after `--fit`:
+   - Expert bytes are read from the model file (GGUF tensor sizes); a warning is printed if the ranking has other sizes (other model or quant).
+   - Dry run: `common_get_device_memory_data` with a probe placement (the top expert of every layer hot), so every layer has both buckets and the compute buffers are measured for the mixed graph, the largest case.
+   - VRAM budget on the first GPU: `free - (model - probe experts) - KV - compute - --moe-vram-margin` (default 512M). With more than one GPU only the first is budgeted (warning).
+   - Greedy fill over all layers by count per byte (unseen experts last, spread over layers, as analyze.py section 4); an expert that does not fit is skipped and smaller ones can still fit.
+3. `--moe-ram-pin <size|auto>`: the next experts in the same order go to the RAM tier up to the size. `auto` = available RAM - host memory of the rest of the model (model without the cold experts, host KV, host compute, from the dry run) - 2 GiB reserve. In the loader:
+   - With mmap, the cold bucket is the merged `ffn_*_exps` tensor itself, left in the file mapping (plain CPU buffer), with global ids and the hot experts skipped. The RAM tier experts are locked in it with `llama_mlock` (mlock / VirtualLock, 64 KiB aligned runs of experts); the rest is not locked and the OS pages it in and out (disk tier). The hot experts are still copied to the GPU.
+   - Without mmap (`--load-mode none`) the cold experts are copied as before and the RAM tier is locked in that copy; there is no disk tier.
+   - Cost: the mapped cold bucket is not repacked (CPU_REPACK needs a copy), so CPU expert compute uses the plain kernels.
+   - Result: `lock: moe placement: RAM tier N experts, X MiB requested, Y MiB locked in R ranges` (info, shown with `-v`), or a warning with how much was locked when a lock call failed (always shown). After the first failure no more locks are tried.
+4. Report, printed by common before the load:
+   ```
+   moe placement from ranking (profile tq.csv, 704 selections, 64 experts)
+     VRAM budget: RPC0: free 16095 MiB - trunk 30 MiB - KV 2 MiB (n_ctx 1024) - compute 297 MiB - margin 15763 MiB = 2 MiB
+     RAM budget: 2 MiB (set by --moe-ram-pin)
+     tier          experts          MiB    share of selections
+     VRAM (hot)         21          2.4                  62.2%
+     RAM (pinned)       18          2.0                  22.7%
+     disk (mmap)        25          2.9                  15.1%
+   ```
+   Without `--moe-ram-pin` the last row is `RAM (cold)`. The share is the expected hit rate if the workload routes like the profile. The loader adds (with `-v`) `load: moe placement: hot N experts (X MiB), cold M experts (Y MiB, copied | in the file mapping | copied, no mmap)`.
+
+Notes:
+
+- Set `-c`. With `n_ctx = 0` the context is the training context (40960 for Qwen3-30B-A3B), whose KV cache takes VRAM from the experts; a warning is printed. `--fit` may also lower the context before the budget is computed.
+- `-ot`, `--cpu-moe`, `--n-cpu-moe` do not apply to the placement tensors; do not combine them with `--moe-placement`.
+- Linux: `RLIMIT_MEMLOCK` (`ulimit -l`, often 8 MB for users) limits locking unless the process has `CAP_IPC_LOCK`. Windows: `VirtualLock` needs a larger working set, which `llama_mlock` requests with `SetProcessWorkingSetSize`; it can still fail for large sizes.
+- New API: `llama_model_params::moe_ram_pin`, `moe_warm`, `n_moe_warm`; `llama_mlock::failed()`. New files `common/moe-placement.{h,cpp}`.
+
+### Verification done (CPU, and RPC device as the "GPU"; tiny Q4_K_M model, 4 layers x 16 experts)
+
+- `--emit-ranking` on the sample-style trace: 4 layers x 16 experts, counts sum to the 704 selections of the trace.
+- CPU only: report says no GPU, all 64 experts cold. `--moe-ram-pin auto` (available 14748 MiB) locks all 7.27 MiB; `--moe-ram-pin 3M` puts 26 experts (71 % of selections) in RAM and 38 on disk, 2.94 MiB locked in 45 ranges.
+- Lock failure: with `CAP_IPC_LOCK` dropped (`setpriv`) and `ulimit -l 256`: `failed to mlock` warning and `only 0.18 MiB locked - locking FAILED`. As root with the capability, locking works regardless of `ulimit -l`.
+- RPC device (reports 16095 MiB free): the budget line matches the real allocation of that run (trunk 30.94 MiB, compute 297.25 MiB measured by the dry run and by the real context alike). With the default margin all 64 experts are hot. With the margin set so that the budget is ~2.6 MiB: 21 experts hot (2.39 MiB, 62 % of selections), 18 pinned (2 MiB locked), 25 left in the mapping; graph splits 10, the same as `--cpu-moe`.
+- Logits (`compare-logits.py`, `-ub 512` and `-ub 1`, same kernels everywhere with `-nr`), all exact (0) against the unsplit model: CPU only - ranking, ranking + `--moe-ram-pin 3M` / `auto` (mapped cold bucket), ranking + pin with `--load-mode none` (copied), the old hot-set file; RPC - ranking with partial budget, the same plus `--moe-ram-pin 2M` (three tiers), ranking with everything hot.
+
+Not verified (needs the GPU machine):
+
+- The budget on CUDA: that `free` from the CUDA device, the trunk, KV and compute from the dry run leave enough room, and that 512M is a good default margin (CUDA has allocations outside ggml buffers, e.g. cuBLAS workspace and the CUDA context).
+- Locking large sizes (GBs) and `VirtualLock` on Windows; the effect of the disk tier when the model does not fit in RAM (Qwen3-30B-A3B Q4_K_M fits in 32 GB, so the disk tier stays empty with `auto`).
+- Speed of the mapped cold bucket (plain kernels) against the copied one (CPU_REPACK).
+- MSVC build of `common/moe-placement.cpp` (uses `GlobalMemoryStatusEx`).
 
 ## Coding rules
 

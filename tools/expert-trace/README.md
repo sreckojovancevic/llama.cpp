@@ -79,6 +79,20 @@ With one trace group the profile is only the first half of each trace. To build 
 
 Load the file with `--moe-placement placement.json` (qwen3moe only, see `WEIGHT_PROVIDER.md` Task 3): the hot experts of each layer go to the GPU, the rest stay on the CPU.
 
+`--emit-ranking <file>` writes every expert of every layer with its selection count in profile A and its bytes, without a budget:
+
+```json
+{
+ "model": "model.gguf", "n_expert": 128, "profile": "serbian.csv+code.csv", "n_selections": 393216,
+ "layers": [
+  {"layer": 0, "experts": [{"id": 0, "count": 312, "bytes": 2654208}, {"id": 1, "count": 0, "bytes": 2654208}, ...]},
+  ...
+ ]
+}
+```
+
+`--moe-placement ranking.json` then picks the hot set at load time from the free VRAM (`--moe-vram-margin`, default 512M), and `--moe-ram-pin <size|auto>` locks the next experts in RAM and leaves the rest to the mmap of the file (see `WEIGHT_PROVIDER.md`, Task 4).
+
 ## Logits check
 
 `compare-logits.py` runs `llama-debug --save-logits` once per named run (at `-ub 512` and `-ub 1` by default) and compares the last-token logits with the first run. `--exact NAME` requires a bit-exact match; other runs are reported. Example: an all-cold placement must match `--cpu-moe` exactly:
