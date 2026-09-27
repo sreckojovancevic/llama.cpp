@@ -42,6 +42,8 @@ is done and measured.**
    **Action: revert these hunks** (or leave them untouched and unused; do not
    build on them). Phase 1 uses a different design, see below.
 
+Status: both hunks reverted (commit "Revert experimental split MoE expert loading").
+
 ## Environment constraints (cloud sandbox)
 
 - Linux, **no GPU**. Build CPU only:
@@ -71,6 +73,8 @@ Create a new tool `tools/expert-trace/` (binary `llama-expert-trace`), modeled o
   `ffn_moe_topk-` (set in `build_moe_ffn` via `cb(selected_experts, "ffn_moe_topk", il)`).
   Verify the exact name in `src/llama-graph.cpp` before relying on it; if it
   differs, use the actual name and document it here.
+  Verified: the name is `ffn_moe_topk-<il>` (`llama_context::graph_get_cb` formats `"%s-%d"`).
+  It is a non-contiguous view of the argsort result, so index it with `nb[0]`/`nb[1]`.
 - In the "data" phase, copy the tensor to host with `ggml_backend_tensor_get`.
   It is I32 with shape `[n_expert_used, n_tokens]`. Parse layer index from the
   name suffix.
@@ -90,6 +94,11 @@ Create a new tool `tools/expert-trace/` (binary `llama-expert-trace`), modeled o
 Done when: builds on CPU, running on a small MoE model produces a CSV whose row
 count equals `n_layer_moe * n_tokens * n_expert_used`, and a sample trace is
 committed under `tools/expert-trace/sample/`.
+
+Status: done. See `tools/expert-trace/README.md`. The prompt is decoded with
+output for all tokens (in `n_ubatch` chunks), otherwise the last layer only runs
+the output tokens. Sample traces come from a tiny random-weight MoE (Hugging Face
+is not reachable from the sandbox), so they test the tool, not real routing.
 
 ## Task 2 - Trace analysis (Python)
 
@@ -115,6 +124,8 @@ Output: a text summary to stdout and PNG plots to an output directory. Include
 a `--help` and a short README section with example commands.
 
 Done when: runs on the committed sample trace and produces all six sections.
+
+Status: done. `analyze.py` runs on the sample traces and prints all six sections.
 
 ## Task 3 - Phase 1 design (do NOT implement until asked)
 
