@@ -79,6 +79,19 @@ With one trace group the profile is only the first half of each trace. To build 
 
 Load the file with `--moe-placement placement.json` (qwen3moe only, see `WEIGHT_PROVIDER.md` Task 3): the hot experts of each layer go to the GPU, the rest stay on the CPU.
 
+## Logits check
+
+`compare-logits.py` runs `llama-debug --save-logits` once per named run (at `-ub 512` and `-ub 1` by default) and compares the last-token logits with the first run. `--exact NAME` requires a bit-exact match; other runs are reported. Example: an all-cold placement must match `--cpu-moe` exactly:
+
+```sh
+echo '{"layers": []}' > all-cold.json
+python3 tools/expert-trace/compare-logits.py --llama-debug build/bin/llama-debug -m model.gguf \
+    --run "ref=--cpu-moe" --run "cold=--moe-placement all-cold.json" --run "placed=--moe-placement placement.json" \
+    --exact cold -- -ngl 99
+```
+
+Runs that use other kernels (hot experts on the GPU) are not bit-exact; judge them with `llama-perplexity --kl-divergence` over many tokens (see `WEIGHT_PROVIDER.md`, Task 3, "Measurement sequence").
+
 ## Sample
 
 `sample/` has two traces (`text.csv`, `code.csv`) from a tiny random-weight llama-arch MoE (6 layers, 16 experts, top-4, Q8_0 experts). They only exercise the tool and the analysis. The routing distribution of a random model says nothing about real models.
