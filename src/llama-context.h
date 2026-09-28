@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_moe_residency;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -363,6 +364,10 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+
+    // Phase 2a: dynamic MoE expert residency, non-null only when model.moe_dynamic(); must be declared (and so
+    // destroyed) after sched/backends above, since its destructor stops a worker thread that uses them
+    std::unique_ptr<llama_moe_residency> moe_residency;
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

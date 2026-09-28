@@ -940,6 +940,11 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
+    // dynamic MoE residency (Phase 2a): per-layer flat selected-expert ids [n_expert_used*n_tokens], marked as an
+    // output tensor so it survives past its use in build_moe_ffn; read back by llama_context after graph_compute.
+    // nullptr for a layer without dynamic residency.
+    std::vector<ggml_tensor *> t_moe_ids;
+
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;

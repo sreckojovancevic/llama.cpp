@@ -1881,7 +1881,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     if (pimpl->moe_placement) {
         pimpl->moe_placement->lock(pimpl->mlock_bufs);
-        pimpl->moe_placement.reset();
+        // dynamic residency (Phase 2a) needs the warm-start hot set after load; the static path frees it here as before
+        if (!pimpl->moe_placement->dynamic()) {
+            pimpl->moe_placement.reset();
+        }
     }
 
     if (use_mmap_buffer) {
@@ -1934,6 +1937,30 @@ uint32_t llama_model::n_moe_placement_nodes() const {
         }
     }
     return res;
+}
+
+bool llama_model::moe_dynamic() const {
+    if (!pimpl->moe_placement || !pimpl->moe_placement->dynamic()) {
+        return false;
+    }
+    // a no_alloc dry run (common_fit_params, before a ranking's VRAM budget is resolved into a hot set) can load
+    // with moe_dynamic requested but no hot bucket yet; only report dynamic residency once every dynamic layer
+    // really has one hot and one cold bucket, i.e. after a real load
+    bool any = false;
+    for (const auto & layer : layers) {
+        if (!layer.moe_pl.dynamic) {
+            continue;
+        }
+        if (layer.moe_pl.buckets.size() != 2) {
+            return false;
+        }
+        any = true;
+    }
+    return any;
+}
+
+const std::vector<int32_t> & llama_model::moe_dynamic_initial_hot(int il) const {
+    return pimpl->moe_placement->initial_hot(il);
 }
 
 size_t llama_model::n_devices() const {
@@ -2834,6 +2861,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mtp                    =*/ false,
         /*.moe_placement               =*/ false,
         /*.moe_ram_pin                 =*/ false,
+        /*.moe_dynamic                 =*/ false,
     };
 
     return result;

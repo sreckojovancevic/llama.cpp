@@ -44,6 +44,13 @@ struct llama_moe_placement {
 
     bool ram_pin() const { return ram_pin_; }
 
+    // dynamic residency (Phase 2a): true when the model was loaded with moe_dynamic
+    bool dynamic() const { return dynamic_; }
+
+    // dynamic residency: the warm-start hot set of layer il, local slot order (ascending global id, as assigned by
+    // create_layer), i.e. initial_hot(il)[s] is the global expert id loaded into local hot slot s
+    const std::vector<int32_t> & initial_hot(int il) const { return initial_hot_by_layer.at(il); }
+
 private:
     ggml_context * ctx_for_buft(ggml_backend_buffer_type_t buft);
 
@@ -68,11 +75,15 @@ private:
 
     int64_t n_expert;
     bool    ram_pin_;
+    bool    dynamic_;
 
     int n_slots = 1;
 
     std::vector<std::vector<int>>  hot_slot; // [n_layer][n_expert]: hot device slot, -1 = cold
     std::vector<std::vector<bool>> is_warm;  // [n_layer][n_expert]
+
+    // dynamic residency only: [n_layer][local hot slot] = global expert id at load time (ascending global id order)
+    std::vector<std::vector<int32_t>> initial_hot_by_layer;
 
     std::vector<slice>      slices;
     std::vector<table>      tables;

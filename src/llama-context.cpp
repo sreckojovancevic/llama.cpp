@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-residency.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -475,6 +476,10 @@ llama_context::llama_context(
         for (int i = 0; i < n_vocab; ++i) {
             sampling.token_ids_full_vocab[i] = i;
         }
+    }
+
+    if (model.moe_dynamic()) {
+        moe_residency = std::make_unique<llama_moe_residency>(model);
     }
 }
 
@@ -1340,6 +1345,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (moe_residency) {
+        // the only point where the host knows no graph is running (PHASE2_REVIEW.md Q4): safe to apply finished
+        // promotions/evictions and start new ones before building/reusing the next graph
+        ggml_backend_sched_synchronize(sched.get());
+        moe_residency->boundary();
+    }
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
@@ -1398,6 +1410,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (moe_residency) {
+        // read at the next boundary(), one ubatch later (PHASE2_REVIEW.md section 9's "one-token commit delay")
+        moe_residency->collect_routing(res);
     }
 
     ret = GGML_STATUS_SUCCESS;

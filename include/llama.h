@@ -364,6 +364,12 @@ extern "C" {
         bool load_mtp;        // whether to load MTP layers
         bool moe_placement;   // split MoE experts into hot and cold buckets, see moe_hot
         bool moe_ram_pin;     // cold experts stay in the mmap of the model file (disk tier), moe_warm experts are locked in RAM
+
+        // [EXPERIMENTAL, Phase 2a] dynamic MoE expert residency on top of moe_placement: moe_hot is the warm-start hot
+        // set (from a ranking, see common_moe_placement_resolve); the hot bucket then acts as a fixed-slot cache that is
+        // updated at ubatch boundaries by second-miss admission and LRU eviction. Off by default: with it false, behavior
+        // is exactly the static moe_placement. Requires moe_placement, a single hot device (no moe_devices) and mmap.
+        bool moe_dynamic;
     };
 
     struct llama_sampler_seq_config {

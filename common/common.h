@@ -470,6 +470,8 @@ struct common_params_moe_placement {
     std::vector<int32_t>            hot_dev;  // index in devices of each hot pair
     bool    ram_pin       = false;           // --moe-ram-pin
     int64_t ram_pin_bytes = -1;              // -1 = auto
+
+    bool dynamic = false; // --moe-dynamic [EXPERIMENTAL, Phase 2a]: needs a ranking file, no --moe-devices
 };
 
 struct common_params {

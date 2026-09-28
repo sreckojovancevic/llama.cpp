@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -86,10 +87,53 @@ def make_model(path, n_layer):
     w.close()
 
 
+def make_ranking_dynamic(path, n_layer):
+    """A ranking where expert id's count halves with each id (id0 highest), the same for every layer. quantize.py
+    can pick a different type per layer for ffn_down_exps (seen: Q4_K on some layers, Q6_K - about 1.46x bigger -
+    on others), which changes each layer's count/byte ratio for a tied count; halving every id keeps a >=2x count
+    gap between id tiers, comfortably above that, so common_moe_placement_resolve's greedy count/byte fill always
+    admits id N of every layer before id N+1 of any layer, regardless of the byte difference. That makes the fill
+    a predictable round robin over layers: expert 0 (and then 1) of every layer is always hot first, so every
+    layer gets at least 2 hot slots (1 pinned + 1 evictable - expert 0 also ends up pinned at local slot 0,
+    create_layer assigns local ids in ascending global-id order) with a small --moe-vram-margin, whatever the
+    quant type of that layer, so --moe-dynamic promotions have somewhere to evict, deterministically."""
+    counts = [1 << (24 - e) for e in range(N_EXPERT)]
+    layers = [{"layer": l, "experts": [{"id": e, "count": counts[e], "bytes": 1} for e in range(N_EXPERT)]} for l in range(n_layer)]
+    with open(path, "w") as f:
+        json.dump({"profile": "deterministic", "layers": layers}, f)
+
+
+def pick_dynamic_margin(build_dir, model, ranking_path, extra, target_experts_per_layer, n_layer):
+    """Probe the VRAM budget report of the placement device (llama-debug -v, default margin) and derive a
+    --moe-vram-margin that leaves room for about target_experts_per_layer experts per layer, on whatever machine
+    this runs on. The report line looks like:
+      VRAM budget: RPC0: free 16095 MiB - trunk 30 MiB - KV 8 MiB (n_ctx 4096) - compute 301 MiB - margin 512 MiB = 15243 MiB
+    budget = free - trunk - kv - compute - margin, so margin = free - trunk - kv - compute - target."""
+    exe = ".exe" if os.name == "nt" else ""
+    cmd = [os.path.join(build_dir, "llama-debug" + exe), "-m", model, "--moe-placement", ranking_path, "-v",
+           "-p", "x", "-n", "0", "-nr"] + extra
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    m_budget = re.search(r"free (\d+) MiB - trunk (\d+) MiB - KV (\d+) MiB[^-]*- compute (\d+) MiB", out)
+    m_hot    = re.search(r"VRAM \(hot\)\s+(\d+)\s+([\d.]+)", out)
+    if not m_budget or not m_hot or int(m_hot.group(1)) == 0:
+        sys.exit(f"error: could not read a VRAM budget report to pick --moe-dynamic-margin; pass a GPU-like "
+                 f"device in the extra args (e.g. --rpc host:port -ngl 99). llama-debug output:\n{out}")
+    free_mib, trunk_mib, kv_mib, compute_mib = (int(x) for x in m_budget.groups())
+    mib_per_expert = float(m_hot.group(2)) / int(m_hot.group(1))
+    target_mib = mib_per_expert * target_experts_per_layer * n_layer
+    margin_mib = max(1, int(free_mib - trunk_mib - kv_mib - compute_mib - target_mib))
+    return f"{margin_mib}M"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--build-dir", default=os.path.join(ROOT, "build", "bin"), help="directory with llama-quantize and llama-debug (default: %(default)s)")
     ap.add_argument("--layers", type=int, default=48)
+    ap.add_argument("--dynamic", action="store_true",
+                     help="also check --moe-dynamic (Phase 2a): needs a GPU-like placement device in the extra "
+                          "args (e.g. --rpc host:port -ngl 99), forces churn (LLAMA_MOE_DYNAMIC_FORCE_CHURN) and "
+                          "asserts that promotions and evictions actually happened")
     ap.add_argument("--out-dir", default=None, help="keep the model and logs here (default: temp dir)")
     ap.add_argument("extra", nargs="*", help="extra llama-debug args for all runs, after --")
     args = ap.parse_args()
@@ -119,7 +163,64 @@ def main():
            "--llama-debug", os.path.join(args.build_dir, "llama-debug" + exe), "-m", q, "--out-dir", os.path.join(out, "logits"),
            "--run", "ref=-nr", "--run", f'hot=--moe-placement "{hot}" -nr', "--run", f'rank=--moe-placement "{rank}" -nr',
            "--exact", "hot", "--exact", "rank", "--"] + args.extra
-    sys.exit(subprocess.run(cmd).returncode)
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+
+    if args.dynamic:
+        # a separate compare-logits.py call, at --ubatch 1 only: the compute-buffer size for a whole -ub 512
+        # ubatch is much larger than this tiny model's total expert weight (a real model wouldn't see this), so
+        # one --moe-vram-margin that leaves a small, partial hot/cold split at -ub 1 would leave none of the
+        # budget at -ub 512 (all cold) or vice versa. -ub 1 is also the case that matters for --moe-dynamic:
+        # PHASE2_DESIGN.md/PHASE2_REVIEW.md scope it to decode, one ubatch boundary per token.
+        rank_dyn = os.path.join(out, "ranking-dynamic.json")
+        make_ranking_dynamic(rank_dyn, args.layers)
+        dyn_extra = args.extra + ["-ub", "1"]
+        margin = pick_dynamic_margin(args.build_dir, q, rank_dyn, dyn_extra, target_experts_per_layer=2.5, n_layer=args.layers)
+        print(f"moe-dynamic: --moe-vram-margin {margin} (probed)")
+
+        env = os.environ.copy()
+        # force every second miss to admit, so a short prompt still exercises promotion and eviction
+        env["LLAMA_MOE_DYNAMIC_FORCE_CHURN"] = "1"
+        # -lv 5: llama_moe_residency::log_counters() uses LLAMA_LOG_INFO (GGML_LOG_LEVEL_INFO), which
+        # common_log_default_callback maps to LOG_LEVEL_TRACE (see common/log.cpp), well above the default
+        # verbosity threshold - same as the existing llama_moe_placement::load() summary line, silent by default.
+        cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "compare-logits.py"),
+               "--llama-debug", os.path.join(args.build_dir, "llama-debug" + exe), "-m", q,
+               "--out-dir", os.path.join(out, "logits-dynamic"), "--ubatch", "1",
+               "--run", "ref=-nr", "--run", f'dyn=--moe-placement "{rank_dyn}" --moe-vram-margin {margin} --moe-dynamic -nr -lv 5',
+               "--exact", "dyn", "--"] + dyn_extra
+        r = subprocess.run(cmd, env=env)
+        if r.returncode != 0:
+            sys.exit(r.returncode)
+
+        # exactness alone does not prove the dynamic path was exercised: a no-op residency manager would also
+        # pass. Check its counters (log_counters(), printed by llama_moe_residency's destructor at exit) to
+        # confirm promotions and evictions (useful promotions) actually happened. A short-lived residency manager
+        # is also built for the no_alloc probe pass inside common_moe_placement_resolve (always all-zero, no real
+        # inference runs there); take the last (real) occurrence.
+        log_dir = os.path.join(out, "logits-dynamic")
+        ok = True
+        for log in sorted(os.listdir(log_dir)):
+            if not (log.startswith("dyn-ub") and log.endswith(".log")):
+                continue
+            text = open(os.path.join(log_dir, log)).read()
+            matches = list(re.finditer(r"moe dynamic residency: hits (\d+), misses (\d+), promotions (\d+), "
+                           r"useful promotions (\d+), bytes copied (\d+)", text))
+            m = matches[-1] if matches else None
+            if not m:
+                print(f"error: {log}: no moe dynamic residency counters found")
+                ok = False
+                continue
+            hits, misses, promotions, useful, bcopied = (int(x) for x in m.groups())
+            print(f"{log}: hits {hits}, misses {misses}, promotions {promotions}, useful promotions {useful}, bytes copied {bcopied}")
+            if promotions == 0 or useful == 0:
+                print(f"error: {log}: expected promotions > 0 and useful promotions > 0 (churn was forced)")
+                ok = False
+        if not ok:
+            sys.exit(1)
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -265,6 +265,7 @@ struct llama_moe_bucket {
 struct llama_layer_moe_placement {
     std::vector<llama_moe_bucket> buckets;          // hot buckets in device order, then the cold (CPU) bucket
     struct ggml_tensor *          bucket = nullptr; // I32 [1, n_expert]: index in buckets of each expert
+    bool                          dynamic = false;  // Phase 2a: buckets[0] is a dynamic residency cache, see llama_moe_residency
 };
 
 struct llama_layer {
@@ -749,6 +750,12 @@ struct llama_model {
 
     // extra graph nodes of the MoE placement (bucket FFNs, id mapping, combine), 0 without it
     uint32_t n_moe_placement_nodes() const;
+
+    // dynamic residency (Phase 2a): true when the model was loaded with moe_dynamic
+    bool moe_dynamic() const;
+    // the warm-start hot set of layer il, local slot order (see llama_moe_placement::initial_hot); moe_dynamic() only
+    const std::vector<int32_t> & moe_dynamic_initial_hot(int il) const;
+
     size_t n_devices() const;
     const float * tensor_split() const;
 

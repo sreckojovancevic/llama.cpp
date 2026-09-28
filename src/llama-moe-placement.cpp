@@ -61,9 +61,10 @@ static ggml_backend_buffer_type_t select_table_buft(const buft_list_t & bufts, i
 }
 
 llama_moe_placement::llama_moe_placement(const llama_model_params & params, int n_layer, int64_t n_expert)
-    : n_expert(n_expert), ram_pin_(params.moe_ram_pin),
+    : n_expert(n_expert), ram_pin_(params.moe_ram_pin), dynamic_(params.moe_dynamic),
       hot_slot(n_layer, std::vector<int>(n_expert, -1)),
       is_warm (n_layer, std::vector<bool>(n_expert, false)),
+      initial_hot_by_layer(dynamic_ ? n_layer : 0),
       max_tensors((size_t) n_layer*9 + 1) {
     n_slots = 1;
     if (params.moe_devices) {
@@ -74,6 +75,9 @@ llama_moe_placement::llama_moe_placement(const llama_model_params & params, int 
         if (n_slots == 0) {
             throw std::runtime_error("moe placement: moe_devices is empty");
         }
+    }
+    if (dynamic_ && n_slots != 1) {
+        throw std::runtime_error("moe placement: moe_dynamic does not support moe_devices (single hot device only)");
     }
     max_tensors = (size_t) n_layer*(4*(n_slots + 1) + 2) + 1;
     slot_n    .assign(n_slots, 0);
@@ -159,6 +163,28 @@ void llama_moe_placement::create_layer(llama_model_loader & ml, llama_layer_moe_
     const int  n_hot_buckets = (int) bucket_slot.size();
     const bool has_cold      = !cold_ids.empty();
 
+    // no_alloc dry runs (common_fit_params measuring free memory, before the ranking budget is resolved into an
+    // actual hot set) can legitimately have no hot experts yet and skip mmap; only the real load needs to satisfy
+    // dynamic residency's requirements. But whenever a dynamic layer does end up with one hot and one cold bucket
+    // (dry run or not - the probe pass inside common_moe_placement_resolve always gives every layer one hot expert),
+    // capture the warm-start set unconditionally: llama_model::moe_dynamic() only looks at the bucket shape, so it
+    // must stay in sync with initial_hot_by_layer regardless of no_alloc.
+    if (dynamic_ && !ml.no_alloc) {
+        // dynamic residency needs a fixed graph shape (both buckets always present, so promotion/eviction never
+        // changes graph topology) and the full merged tensor as the cold bucket, so every expert stays addressable
+        if (n_hot_buckets != 1 || !has_cold) {
+            throw std::runtime_error(format("moe placement: layer %d has no hot or no cold experts, moe_dynamic needs "
+                        "both in every layer (adjust the VRAM budget / --moe-vram-margin)", il));
+        }
+        if (!cold_merged) {
+            throw std::runtime_error("moe placement: moe_dynamic needs mmap (remove --no-mmap / --load-mode none)");
+        }
+    }
+    if (dynamic_ && n_hot_buckets == 1 && has_cold) {
+        initial_hot_by_layer[il] = slot_ids[bucket_slot[0]];
+    }
+
+    pl.dynamic = dynamic_;
     pl.buckets.assign(n_hot_buckets + (has_cold ? 1 : 0), llama_moe_bucket());
 
     std::vector<std::vector<int32_t>> ids(pl.buckets.size());

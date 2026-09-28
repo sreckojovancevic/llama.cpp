@@ -1332,6 +1332,9 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_moe_ids.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_moe_ids.begin(), t_moe_ids.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -2344,6 +2347,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(n_buckets > 0);
 
         ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
+
+        if (moe_pl->dynamic && il >= 0 && il < (int) res->t_moe_ids.size()) {
+            // keep ids_flat alive past this layer's MoE block so llama_context can read it back after graph_compute
+            ggml_set_output(ids_flat);
+            res->t_moe_ids[il] = ids_flat;
+        }
 
         // the skip flag keeps the cold bucket on the CPU; at batches where a GPU backend would offload a CPU MUL_MAT_ID
         // (as with --cpu-moe; CUDA: GGML_OP_OFFLOAD_MIN_BATCH, default 32) run it unflagged instead, so it can be offloaded

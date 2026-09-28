@@ -164,12 +164,18 @@ void common_moe_placement_resolve(common_params & params, llama_model_params & m
         if (!moe.devices.empty()) {
             throw std::invalid_argument("--moe-devices needs --moe-placement with a ranking file (analyze.py --emit-ranking)");
         }
+        if (moe.dynamic) {
+            throw std::invalid_argument("--moe-dynamic needs --moe-placement with a ranking file (analyze.py --emit-ranking)");
+        }
         if (moe.enabled && moe.ram_pin) {
             LOG_WRN("%s: --moe-ram-pin needs a ranking file (analyze.py --emit-ranking), ignored\n", __func__);
             moe.ram_pin = false;
             mparams.moe_ram_pin = false;
         }
         return;
+    }
+    if (moe.dynamic && !moe.devices.empty()) {
+        throw std::invalid_argument("--moe-dynamic does not support --moe-devices (single hot device only)");
     }
 
     auto & R = moe.ranking;

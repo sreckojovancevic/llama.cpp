@@ -2809,6 +2809,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_RAM_PIN"));
     add_opt(common_arg(
+        {"--moe-dynamic"},
+        "[EXPERIMENTAL, Phase 2a] with a --moe-placement ranking: the hot bucket becomes a dynamic cache, updated at\n"
+        "each ubatch boundary by second-miss admission and LRU eviction, instead of staying fixed after load; needs\n"
+        "mmap and a single hot device (no --moe-devices); off by default, decode only",
+        [](common_params & params) {
+            params.moe.dynamic = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_DYNAMIC"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
