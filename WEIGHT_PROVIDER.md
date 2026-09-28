@@ -586,3 +586,143 @@ HAGS is not proven to matter. Practical rules for measuring on Windows:
 - run each configuration at least twice and compare configurations within one boot;
 - the ranking placement is more sensitive to this than --n-cpu-moe, because it has a
   CPU<->GPU split in every layer.
+
+## Task 8 - Phase 2a, first milestone (2026-09-28)
+
+Implements the Phase 2a MVP from PHASE2_REVIEW.md section 6/9 on top of Phase 1's static
+placement: `--moe-dynamic` (opt-in, needs `--moe-placement` with a ranking, no
+`--moe-devices`, mmap). Off by default; with it off, `llama_layer_moe_placement::dynamic`
+stays false and the graph/loader path is exactly Phase 1's (no behavior change verified
+below).
+
+What it does, matching PHASE2_REVIEW.md's design:
+- warm start: the hot bucket's slots keep their Phase 1 ranking assignment at load
+  (`llama_moe_placement::initial_hot`, ascending global id order); local slot 0 always
+  ends up the lowest-global-id hot expert and is pinned (never chosen as an eviction
+  victim), matching PHASE2_REVIEW.md Q3/Q5.
+- miss accounting and second-miss admission: `build_moe_ffn` marks the per-layer flat
+  selected-expert-ids tensor as a graph output when the layer is dynamic
+  (`llm_graph_result::t_moe_ids`); `llama_context` reads it back after `graph_compute`
+  and hands it to the residency manager at the next `process_ubatch` boundary, one
+  ubatch delayed (PHASE2_REVIEW.md's "one-token commit delay"). A cold expert is
+  admitted for promotion on its second miss within 8 boundary calls (`ADMIT_WINDOW` in
+  `llama-moe-residency.cpp`, matching the measurement above), or on every miss under
+  `LLAMA_MOE_DYNAMIC_FORCE_CHURN=1` (a debug env var to force churn deterministically in
+  a short test, per PHASE2_REVIEW.md risk 6).
+- promotion: a dedicated worker thread with its own `ggml_backend_t` for the hot
+  device and a pinned (or plain CPU, when the device has no host buffer type - e.g.
+  RPC) staging region copies the expert from the cold (mmap) tensor into the staging
+  buffer, then `ggml_backend_tensor_set_async` + `ggml_backend_synchronize` into the
+  victim slot, separate from the compute stream. No ggml core change: this is the
+  existing public backend API (PHASE2_REVIEW.md Q2/Q5/Q6).
+- eviction: table update only (bucket + cold ids entries of the victim, done
+  synchronously on the main thread before the copy starts) - no data movement, the
+  merged cold tensor already holds every expert (PHASE2_REVIEW.md section 16).
+- commit: promotions and evictions are only ever written to the device tables at a
+  `process_ubatch` boundary, after `ggml_backend_sched_synchronize`, and only once the
+  worker's copy has completed (a `done` queue drained at the boundary).
+- counters: hits, misses, promotions, useful promotions (a promoted slot that was hit
+  at least once before its next eviction), bytes copied, logged via `LLAMA_LOG_INFO`
+  (same as the rest of this module - needs `-lv 5`/`--log-verbosity 5` to show, since
+  `common_log_default_callback` maps `GGML_LOG_LEVEL_INFO` to trace verbosity) from
+  `llama_moe_residency`'s destructor, so they print however the process exits.
+
+New file `src/llama-moe-residency.{h,cpp}` (~420 lines); small additions to
+`llama-moe-placement.{h,cpp}` (capture the warm-start set, validate both buckets/mmap/
+single device for a dynamic layer, keep the placement object alive after load instead
+of freeing it), `llama-model.{h,cpp}` (`moe_dynamic()`/`moe_dynamic_initial_hot()`,
+`llama_layer_moe_placement::dynamic`), `llama-graph.{h,cpp}` (`t_moe_ids` output
+capture), `llama-context.{h,cpp}` (own the residency manager, boundary()/
+collect_routing() calls), `include/llama.h` + `common/` (the flag and its plumbing).
+
+### Verification (CPU, and an RPC device as the hot device - same pattern as Task 3-7)
+
+- `test-backend-ops -b CPU -o MUL_MAT_ID`: 930/930 pass (no ggml change in this task,
+  so unaffected, but re-run for the record).
+- `tools/expert-trace/regress-placement.py --dynamic` (new `--dynamic` flag): builds a
+  ranking where every expert's count roughly halves with its id, the same for every
+  layer, so `common_moe_placement_resolve`'s greedy count/byte fill is a deterministic
+  round robin over layers regardless of per-layer expert byte differences (this model's
+  quantizer picks Q6_K for `ffn_down_exps` on some layers and Q4_K on others - about
+  1.46x - which is enough to starve a layer's hot bucket under a naively "equal counts"
+  ranking; the id-halving keeps a >=2x gap between id tiers, safely above that). This
+  guarantees every layer has at least 2 hot slots (pinned + 1 evictable) at a small
+  `--moe-vram-margin`, itself picked by probing the VRAM budget report at the ubatch
+  size that will actually run. Ran at 4 and 48 layers.
+  - `--moe-dynamic` vs the unsplit model (`-nr`, same kernels): exact (max abs diff 0)
+    at `-ub 1` (decode; PHASE2_DESIGN.md/PHASE2_REVIEW.md scope Phase 2a to decode),
+    with `LLAMA_MOE_DYNAMIC_FORCE_CHURN=1` and its counters checked to confirm
+    promotions and useful promotions were both > 0 (not just exact-by-no-op): 433
+    promotions, 54 useful, 49 MiB copied at 4 layers; 6468 promotions, 1434 useful,
+    719 MiB copied at 48 layers, from an 87-token prompt processed one token per
+    ubatch.
+  - Static placement (`hot`/`rank`, unaffected by this task) still exact at `-ub 512`
+    and `-ub 1`, on CPU alone and with the RPC device, confirming the opt-in flag is a
+    true no-op for everyone who does not pass it.
+  - `-ub 512` (prefill, one ubatch for the whole prompt) was not run for `--moe-dynamic`
+    on this tiny model: its compute-buffer size (hundreds of MiB, for KV cache/graph
+    overhead unrelated to the ~1-10 MiB of tiny toy experts) swamps any small VRAM
+    budget that would leave part of the hot bucket cold, so no ubatch-size-shared
+    margin gives a partial hot/cold split at both `-ub 512` and `-ub 1` on this model.
+    A real model's expert weights are orders of magnitude larger than this gap, so this
+    is a tiny-test-model artifact, not a Phase 2a limitation - and prefill correctness
+    for the static hot/cold split it inherits was already covered by Task 3-7's checks.
+- Race review: PHASE2_REVIEW.md invariant 1 ("GPU never executes from a slot that is
+  being overwritten") needed one more table write I had missed: on eviction, resetting
+  the victim's `ids_hot` entry back to 0 (the same dummy every other cold expert uses),
+  not just its `bucket`/`cold_ids*` entries. Without it, a graph that selects the
+  just-evicted expert again before its next promotion would still read the victim slot
+  for the discarded one-slot-per-row computation (PHASE2_REVIEW.md section 10/Q3),
+  racing with the worker thread about to overwrite that slot for someone else. CPU/RPC
+  testing cannot exercise this (their `set_tensor_async` falls back to a synchronous,
+  already-serialized set), so it would not have shown up as a logit mismatch here; it
+  is a correctness requirement for the real CUDA path. Fixed before verification above.
+
+### Known simplifications in this milestone (not correctness issues, listed for the next one)
+
+- Routing readback (`llama_context::collect_routing`) uses a synchronous
+  `ggml_backend_tensor_get` right after `graph_compute` returns, not the async D2H +
+  read-at-next-boundary PHASE2_REVIEW.md Q8 describes. Simpler and still correct (it is
+  a few KiB), but adds one extra host sync per ubatch instead of zero, when dynamic
+  residency is on. Swappable for the async version later without changing the
+  interface.
+- No admission rate limit (max experts in flight, byte budget per token) from
+  PHASE2_REVIEW.md Q9/section 13 beyond the second-miss window and one promotion in
+  flight per slot: a single worker thread processes the queue serially, which already
+  bounds concurrency to 1, but does not bound PCIe/RAM bytes per token. Worth adding if
+  real measurements show thrashing.
+- Admission applies at every ubatch size, not decode-only as PHASE2_REVIEW.md section 9
+  scopes it (prefill only seeds). Does not affect correctness (commits are always at a
+  synchronized boundary regardless of ubatch size); it may promote experts during a
+  large prefill batch that a decode-only policy would not have. Left as is for this
+  milestone; worth gating on `ubatch.n_tokens == 1` alongside prefill seeding later.
+- `ADMIT_WINDOW` (8) is a compile-time constant, not a CLI flag, to keep this
+  milestone's surface small; matches the value already measured in the decision data
+  above.
+- The residency manager also gets constructed (and destructed) for the `no_alloc` dry
+  runs `common_fit_params`/`common_moe_placement_resolve`'s probe step make before the
+  real load (harmless - all-zero counters, confirmed above - but spins up a worker
+  thread and a staging buffer for a throwaway context). Not measured; likely negligible
+  next to a real model's load time, but worth avoiding if it shows up.
+
+### Still needs the owner's GPU (not verifiable in this CPU-only sandbox)
+
+- CUDA correctness: exact logits vs `--cpu-moe` are only verified with identical
+  kernels (CPU/RPC); PHASE2_REVIEW.md's own correctness gate is exact on CPU/RPC, KLD
+  on CUDA, same as Task 3-7. Also re-run `regress-placement.py`, ideally with a wider
+  VRAM margin sweep (a small tiny-model budget was needed here only because of the
+  probe workaround above, not a real constraint on real hardware).
+- Whether the pinned staging buffer (`ggml_backend_dev_host_buffer_type`) and the
+  second `ggml_backend_t` on the same CUDA device actually overlap the promotion copy
+  with compute under WDDM, and whether `cudaHostRegister` on the mmap'd staging source
+  would help (PHASE2_REVIEW.md Q6/risk 3) - both need real timing.
+- Speed: decode t/s of `--moe-dynamic` vs the Task 6 ranking baseline, in and out of
+  domain, per PHASE2_REVIEW.md section 22's matrix; the realistic hit rate vs the
+  simulated one in the decision data above; whether the RAM-bandwidth contention risk
+  (PHASE2_REVIEW.md risk 1, staging copy + cold FFN sharing RAM bandwidth) is real.
+- Whether the extra host sync per ubatch from the synchronous routing readback
+  (see "known simplifications") is measurable, before deciding whether to switch it to
+  async.
+
+Not started: Phase 2b (predictor/intra-token prefetch) and the GPU/CPU overlap work,
+per the instruction to keep this milestone to Phase 2a only.
