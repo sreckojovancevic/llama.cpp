@@ -2812,11 +2812,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-dynamic"},
         "[EXPERIMENTAL, Phase 2a] with a --moe-placement ranking: the hot bucket becomes a dynamic cache, updated at\n"
         "each ubatch boundary by second-miss admission and LRU eviction, instead of staying fixed after load; needs\n"
-        "mmap and a single hot device (no --moe-devices); off by default, decode only",
+        "mmap and a single hot device (no --moe-devices); off by default. See --moe-dynamic-batch-threshold,\n"
+        "--moe-dynamic-decode-window and --moe-dynamic-bw to change the admission policy; each is off by default,\n"
+        "so the base --moe-dynamic behavior is reproducible without them",
         [](common_params & params) {
             params.moe.dynamic = true;
         }
     ).set_env("LLAMA_ARG_MOE_DYNAMIC"));
+    add_opt(common_arg(
+        {"--moe-dynamic-batch-threshold"}, "N",
+        "[EXPERIMENTAL, Phase 2a] with --moe-dynamic: no promotions from ubatches with more than N tokens (their\n"
+        "misses/hits are still counted, separately from smaller ubatches); off by default (0); try 32, the\n"
+        "--n-cpu-moe / op offload batch size",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe.dynamic_batch_threshold = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_DYNAMIC_BATCH_THRESHOLD"));
+    add_opt(common_arg(
+        {"--moe-dynamic-decode-window"},
+        "[EXPERIMENTAL, Phase 2a] with --moe-dynamic: count the second-miss admission window in ubatch tokens\n"
+        "instead of one tick per ubatch regardless of size; off by default",
+        [](common_params & params) {
+            params.moe.dynamic_decode_window = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_DYNAMIC_DECODE_WINDOW"));
+    add_opt(common_arg(
+        {"--moe-dynamic-bw"}, "MB/s",
+        "[EXPERIMENTAL, Phase 2a] with --moe-dynamic: cap bytes admitted for promotion at one ubatch boundary to\n"
+        "this many MB/s times the wall-clock time since the previous eligible boundary; off by default (0); try\n"
+        "12000",
+        [](common_params & params, const std::string & value) {
+            params.moe.dynamic_bw_mbs = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_DYNAMIC_BW"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

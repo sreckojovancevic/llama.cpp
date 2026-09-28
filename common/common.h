@@ -472,6 +472,11 @@ struct common_params_moe_placement {
     int64_t ram_pin_bytes = -1;              // -1 = auto
 
     bool dynamic = false; // --moe-dynamic [EXPERIMENTAL, Phase 2a]: needs a ranking file, no --moe-devices
+
+    // each off by default, see llama_model_params for what they do
+    int32_t dynamic_batch_threshold = 0;     // --moe-dynamic-batch-threshold
+    float   dynamic_bw_mbs          = 0.0f;  // --moe-dynamic-bw
+    bool    dynamic_decode_window   = false; // --moe-dynamic-decode-window
 };
 
 struct common_params {

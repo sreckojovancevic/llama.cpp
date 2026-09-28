@@ -1963,6 +1963,18 @@ const std::vector<int32_t> & llama_model::moe_dynamic_initial_hot(int il) const 
     return pimpl->moe_placement->initial_hot(il);
 }
 
+int32_t llama_model::moe_dynamic_batch_threshold() const {
+    return params.moe_dynamic_batch_threshold; // 0 = disabled (no gate)
+}
+
+float llama_model::moe_dynamic_bw_mbs() const {
+    return params.moe_dynamic_bw_mbs; // 0 = disabled (no cap)
+}
+
+bool llama_model::moe_dynamic_decode_window() const {
+    return params.moe_dynamic_decode_window;
+}
+
 size_t llama_model::n_devices() const {
     return devices.size();
 }
@@ -2853,6 +2865,8 @@ llama_model_params llama_model_default_params() {
         /*.n_moe_warm                  =*/ 0,
         /*.moe_devices                 =*/ nullptr,
         /*.moe_hot_dev                 =*/ nullptr,
+        /*.moe_dynamic_batch_threshold =*/ 0,
+        /*.moe_dynamic_bw_mbs          =*/ 0.0f,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
@@ -2862,6 +2876,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_placement               =*/ false,
         /*.moe_ram_pin                 =*/ false,
         /*.moe_dynamic                 =*/ false,
+        /*.moe_dynamic_decode_window   =*/ false,
     };
 
     return result;

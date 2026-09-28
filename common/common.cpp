@@ -1720,6 +1720,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_devices   = params.moe.dev_ptrs.empty() ? nullptr : params.moe.dev_ptrs.data();
     mparams.moe_hot_dev   = params.moe.hot_dev.data();
     mparams.moe_dynamic   = params.moe.dynamic;
+    mparams.moe_dynamic_batch_threshold = params.moe.dynamic_batch_threshold;
+    mparams.moe_dynamic_bw_mbs          = params.moe.dynamic_bw_mbs;
+    mparams.moe_dynamic_decode_window   = params.moe.dynamic_decode_window;
 
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;

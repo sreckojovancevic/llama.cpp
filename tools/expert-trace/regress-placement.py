@@ -185,11 +185,16 @@ def main():
         # -lv 5: llama_moe_residency::log_counters() uses LLAMA_LOG_INFO (GGML_LOG_LEVEL_INFO), which
         # common_log_default_callback maps to LOG_LEVEL_TRACE (see common/log.cpp), well above the default
         # verbosity threshold - same as the existing llama_moe_placement::load() summary line, silent by default.
+        # also check the admission-policy switches together (each off by default, see WEIGHT_PROVIDER.md): still
+        # exact, since they only change which/how many promotions are admitted, never correctness of a promotion
+        # once admitted
+        switches = "--moe-dynamic-batch-threshold 32 --moe-dynamic-decode-window --moe-dynamic-bw 12000"
         cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "compare-logits.py"),
                "--llama-debug", os.path.join(args.build_dir, "llama-debug" + exe), "-m", q,
                "--out-dir", os.path.join(out, "logits-dynamic"), "--ubatch", "1",
                "--run", "ref=-nr", "--run", f'dyn=--moe-placement "{rank_dyn}" --moe-vram-margin {margin} --moe-dynamic -nr -lv 5',
-               "--exact", "dyn", "--"] + dyn_extra
+               "--run", f'dyn_sw=--moe-placement "{rank_dyn}" --moe-vram-margin {margin} --moe-dynamic {switches} -nr -lv 5',
+               "--exact", "dyn", "--exact", "dyn_sw", "--"] + dyn_extra
         r = subprocess.run(cmd, env=env)
         if r.returncode != 0:
             sys.exit(r.returncode)
@@ -202,19 +207,26 @@ def main():
         log_dir = os.path.join(out, "logits-dynamic")
         ok = True
         for log in sorted(os.listdir(log_dir)):
-            if not (log.startswith("dyn-ub") and log.endswith(".log")):
+            if not ((log.startswith("dyn-ub") or log.startswith("dyn_sw-ub")) and log.endswith(".log")):
                 continue
             text = open(os.path.join(log_dir, log)).read()
-            matches = list(re.finditer(r"moe dynamic residency: hits (\d+), misses (\d+), promotions (\d+), "
-                           r"useful promotions (\d+), bytes copied (\d+)", text))
+            matches = list(re.finditer(
+                r"moe dynamic residency: hits (\d+) \(prefill (\d+), decode (\d+)\), "
+                r"misses (\d+) \(prefill (\d+), decode (\d+)\), promotions (\d+), "
+                r"useful promotions (\d+) \(([\d.]+)%\), bytes copied (\d+), decode tokens (\d+), "
+                r"bytes/decode token ([\d.]+)", text))
             m = matches[-1] if matches else None
             if not m:
                 print(f"error: {log}: no moe dynamic residency counters found")
                 ok = False
                 continue
-            hits, misses, promotions, useful, bcopied = (int(x) for x in m.groups())
-            print(f"{log}: hits {hits}, misses {misses}, promotions {promotions}, useful promotions {useful}, bytes copied {bcopied}")
-            if promotions == 0 or useful == 0:
+            (hits, hits_pre, hits_dec, misses, misses_pre, misses_dec, promotions, useful, useful_pct,
+                    bcopied, decode_tokens, bytes_per_dec) = m.groups()
+            print(f"{log}: hits {hits} (prefill {hits_pre}, decode {hits_dec}), misses {misses} (prefill "
+                  f"{misses_pre}, decode {misses_dec}), promotions {promotions}, useful promotions {useful} "
+                  f"({useful_pct}%), bytes copied {bcopied}, decode tokens {decode_tokens}, "
+                  f"bytes/decode token {bytes_per_dec}")
+            if int(promotions) == 0 or int(useful) == 0:
                 print(f"error: {log}: expected promotions > 0 and useful promotions > 0 (churn was forced)")
                 ok = False
         if not ok:

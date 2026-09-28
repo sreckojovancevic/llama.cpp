@@ -1414,7 +1414,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (moe_residency) {
         // read at the next boundary(), one ubatch later (PHASE2_REVIEW.md section 9's "one-token commit delay")
-        moe_residency->collect_routing(res);
+        moe_residency->collect_routing(res, ubatch.n_tokens);
     }
 
     ret = GGML_STATUS_SUCCESS;

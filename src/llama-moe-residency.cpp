@@ -5,16 +5,27 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
-// second miss of a cold expert within this many boundary() calls (ubatches) admits it for promotion; matches the
-// setting measured in WEIGHT_PROVIDER.md "Phase 2a decision data" (section 8 of analyze.py)
+// second miss of a cold expert within this many ticks admits it for promotion; matches the setting measured in
+// WEIGHT_PROVIDER.md "Phase 2a decision data" (section 8 of analyze.py). A tick is one ubatch by default, or one
+// ubatch token with moe_dynamic_decode_window.
 static constexpr int32_t ADMIT_WINDOW = 8;
 
 llama_moe_residency::llama_moe_residency(const llama_model & model) {
     force_churn = getenv("LLAMA_MOE_DYNAMIC_FORCE_CHURN") != nullptr;
+
+    if (const char * path = getenv("LLAMA_MOE_DYNAMIC_LOG")) {
+        log_enabled = true;
+        log_path    = path;
+    }
+
+    batch_threshold = model.moe_dynamic_batch_threshold();
+    decode_window   = model.moe_dynamic_decode_window();
+    bw_mbs          = model.moe_dynamic_bw_mbs();
 
     ggml_backend_dev_t transfer_dev = nullptr;
 
@@ -72,7 +83,9 @@ llama_moe_residency::llama_moe_residency(const llama_model & model) {
 
         ls.expert_slot     = std::vector<int32_t>(ls.n_expert, -1);
         ls.last_miss_tick  = std::vector<int32_t>(ls.n_expert, -1);
+        ls.miss_streak     = std::vector<int32_t>(ls.n_expert, 0);
         ls.in_flight       = std::vector<bool>(ls.n_expert, false);
+        ls.last_promo_id   = std::vector<int64_t>(ls.n_expert, -1);
         ls.pending_routing.clear();
 
         for (int32_t s = 0; s < ls.n_slots; ++s) {
@@ -119,8 +132,9 @@ llama_moe_residency::llama_moe_residency(const llama_model & model) {
 
     worker = std::thread(&llama_moe_residency::worker_main, this);
 
-    LLAMA_LOG_INFO("%s: moe dynamic residency: %zu layers, device %s%s\n", __func__, layers_.size(),
-            ggml_backend_dev_name(transfer_dev), force_churn ? " [FORCE CHURN]" : "");
+    LLAMA_LOG_INFO("%s: moe dynamic residency: %zu layers, device %s%s; batch_threshold=%d decode_window=%d bw_mbs=%.0f%s\n",
+            __func__, layers_.size(), ggml_backend_dev_name(transfer_dev), force_churn ? " [FORCE CHURN]" : "",
+            batch_threshold, (int) decode_window, bw_mbs, log_enabled ? " [EVENT LOG]" : "");
 }
 
 llama_moe_residency::~llama_moe_residency() {
@@ -134,6 +148,9 @@ llama_moe_residency::~llama_moe_residency() {
     }
     if (transfer_backend) {
         ggml_backend_free(transfer_backend);
+    }
+    if (log_enabled) {
+        write_promo_log();
     }
     log_counters();
 }
@@ -149,6 +166,11 @@ void llama_moe_residency::worker_main() {
             }
             j = queue.front();
             queue.pop_front();
+        }
+
+        if (j.promo_id >= 0) {
+            std::lock_guard<std::mutex> lock(log_mu);
+            log[j.promo_id].t_transfer_start_us = ggml_time_us();
         }
 
         layer_state & ls = layers_[j.il];
@@ -167,9 +189,14 @@ void llama_moe_residency::worker_main() {
         ggml_backend_tensor_set_async(transfer_backend, ls.hot_down, staging_down, (size_t) j.slot*nb_down, nb_down);
         ggml_backend_synchronize(transfer_backend);
 
+        if (j.promo_id >= 0) {
+            std::lock_guard<std::mutex> lock(log_mu);
+            log[j.promo_id].t_transfer_end_us = ggml_time_us();
+        }
+
         {
             std::lock_guard<std::mutex> lock(mu);
-            done.push_back({ j.il, j.expert, j.slot, nb_gate + nb_up + nb_down });
+            done.push_back({ j.il, j.expert, j.slot, nb_gate + nb_up + nb_down, j.promo_id });
         }
     }
 }
@@ -195,10 +222,77 @@ void llama_moe_residency::commit_promotion(const completion & c) {
 
     n_promotions++;
     n_bytes_copied += c.bytes;
+
+    if (c.promo_id >= 0) {
+        std::lock_guard<std::mutex> lock(log_mu);
+        log[c.promo_id].token_commit = total_tokens;
+    }
 }
 
-void llama_moe_residency::admit(int il, int32_t expert) {
+int64_t llama_moe_residency::log_new_promo(int il, int32_t expert, bool phase_prefill, const char * reason,
+        int32_t misses_in_window, int32_t victim_expert, int64_t victim_promo_id, size_t bytes) {
+    std::lock_guard<std::mutex> lock(log_mu);
+    const int64_t id = (int64_t) log.size();
+    log.push_back({});
+    promo_event & pe = log[id];
+    pe.promo_id       = id;
+    pe.layer           = il;
+    pe.expert          = expert;
+    pe.phase_prefill   = phase_prefill;
+    pe.ubatch_size     = pending_n_tokens;
+    pe.token_admit     = total_tokens;
+    pe.reason          = reason;
+    pe.misses_in_window = misses_in_window;
+    pe.t_admit_us      = ggml_time_us();
+    pe.victim_expert   = victim_expert;
+    pe.victim_promo_id = victim_promo_id;
+    pe.bytes           = bytes;
+    return id;
+}
+
+void llama_moe_residency::log_evict(int64_t promo_id, int64_t token) {
+    if (promo_id < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(log_mu);
+    promo_event & pe = log[promo_id];
+    if (pe.token_evict < 0) {
+        pe.token_evict   = token;
+        pe.evict_reason  = "LRU";
+    }
+}
+
+void llama_moe_residency::write_promo_log() const {
+    FILE * f = fopen(log_path.c_str(), "w");
+    if (!f) {
+        LLAMA_LOG_WARN("%s: moe dynamic residency: failed to open LLAMA_MOE_DYNAMIC_LOG '%s'\n", __func__, log_path.c_str());
+        return;
+    }
+    fprintf(f, "promo_id,layer,expert,phase,ubatch_size,token_admit,reason,misses_in_window,t_admit_us,"
+            "t_transfer_start_us,t_transfer_end_us,token_commit,demands_while_pending,token_first_reuse,"
+            "reuse_count,token_evict,evict_reason,victim_expert,victim_promo_id,re_misses_after_eviction,bytes\n");
+    std::lock_guard<std::mutex> lock(log_mu);
+    for (const auto & pe : log) {
+        fprintf(f, "%lld,%d,%d,%s,%u,%lld,%s,%d,%lld,%lld,%lld,%lld,%d,%lld,%d,%lld,%s,%d,%lld,%d,%zu\n",
+                (long long) pe.promo_id, pe.layer, pe.expert, pe.phase_prefill ? "prefill" : "decode",
+                pe.ubatch_size, (long long) pe.token_admit, pe.reason, pe.misses_in_window,
+                (long long) pe.t_admit_us, (long long) pe.t_transfer_start_us, (long long) pe.t_transfer_end_us,
+                (long long) pe.token_commit, pe.demands_while_pending, (long long) pe.token_first_reuse,
+                pe.reuse_count, (long long) pe.token_evict, pe.evict_reason, pe.victim_expert,
+                (long long) pe.victim_promo_id, pe.re_misses_after_eviction, pe.bytes);
+    }
+    fclose(f);
+    LLAMA_LOG_INFO("%s: moe dynamic residency: wrote %zu promotion events to '%s'\n", __func__, log.size(), log_path.c_str());
+}
+
+bool llama_moe_residency::admit(int il, int32_t expert, bool phase_prefill, const char * reason) {
     layer_state & ls = layers_[il];
+
+    const size_t bytes = ls.hot_gate->nb[2] + ls.hot_up->nb[2] + ls.hot_down->nb[2];
+    if (bw_mbs > 0.0f && (double) bytes > budget_bytes) {
+        // over the byte budget for this boundary; try again on a later miss
+        return false;
+    }
 
     // victim: least recently used non-pinned, non-pending slot; slot 0 is always pinned
     int32_t victim_slot = -1;
@@ -214,12 +308,16 @@ void llama_moe_residency::admit(int il, int32_t expert) {
     }
     if (victim_slot < 0) {
         // every non-pinned slot has a promotion in flight; try again on a later miss
-        return;
+        return false;
     }
 
     const int32_t victim_expert = ls.slot_expert[victim_slot];
     if (ls.slot_used_since_promote[victim_slot]) {
         n_useful_promotions++;
+    }
+    const int64_t victim_promo_id = ls.last_promo_id[victim_expert];
+    if (log_enabled) {
+        log_evict(victim_promo_id, total_tokens);
     }
 
     set_i32(ls.bucket,    victim_expert, 1); // bucket 1 = cold
@@ -236,16 +334,26 @@ void llama_moe_residency::admit(int il, int32_t expert) {
     ls.slot_last_use[victim_slot] = tick;
     ls.in_flight[expert] = true;
 
+    int64_t promo_id = -1;
+    if (log_enabled) {
+        promo_id = log_new_promo(il, expert, phase_prefill, reason, ls.miss_streak[expert], victim_expert,
+                victim_promo_id, bytes);
+    }
+    ls.last_promo_id[expert] = promo_id;
+
+    if (bw_mbs > 0.0f) {
+        budget_bytes -= (double) bytes;
+    }
+
     {
         std::lock_guard<std::mutex> lock(mu);
-        queue.push_back({ il, expert, victim_slot });
+        queue.push_back({ il, expert, victim_slot, promo_id });
     }
     cv.notify_one();
+    return true;
 }
 
 void llama_moe_residency::boundary() {
-    ++tick;
-
     // 1. apply finished promotions
     std::vector<completion> finished;
     {
@@ -256,40 +364,109 @@ void llama_moe_residency::boundary() {
         commit_promotion(c);
     }
 
-    // 2. process the routing collected after the previous graph_compute
+    if (pending_n_tokens == 0) {
+        return;
+    }
+
+    const bool phase_prefill = pending_n_tokens > 1;
+    const bool admission_ok  = !(batch_threshold > 0 && (int32_t) pending_n_tokens > batch_threshold);
+
+    total_tokens += pending_n_tokens;
+    tick += decode_window ? (int32_t) pending_n_tokens : 1;
+
+    const int64_t now = ggml_time_us();
+    if (bw_mbs > 0.0f) {
+        const double dt_s = last_boundary_time_us >= 0 ? (now - last_boundary_time_us) / 1e6 : 0.0;
+        budget_bytes = (double) bw_mbs * 1e6 * dt_s;
+    }
+    last_boundary_time_us = now;
+
+    // 2. process the routing collected after the previous graph_compute, in two passes so that admissions decided
+    // from this ubatch's own misses never change whether an earlier entry of the same ubatch counts as a hit or a
+    // miss (see the session notes: interleaving them undercounted hits badly on a large prefill ubatch, since an
+    // expert evicted by entry #500 would wrongly show entries #1..499 of the same expert as misses, even though
+    // the actual graph read it hot throughout)
     for (size_t il = 0; il < layers_.size(); ++il) {
         layer_state & ls = layers_[il];
         if (ls.n_slots == 0) {
             continue;
         }
+
+        std::vector<int32_t> candidates;
+        std::vector<bool> queued_candidate(ls.n_expert, false);
+
         for (int32_t e : ls.pending_routing) {
             const int32_t slot = ls.expert_slot[e];
             if (slot >= 0) {
-                n_hits++;
+                // hit
+                if (phase_prefill) n_hits_prefill++; else n_hits_decode++;
                 ls.slot_last_use[slot] = tick;
                 ls.slot_used_since_promote[slot] = true;
+                if (log_enabled && ls.last_promo_id[e] >= 0) {
+                    std::lock_guard<std::mutex> lock(log_mu);
+                    promo_event & pe = log[ls.last_promo_id[e]];
+                    if (pe.token_commit >= 0) {
+                        if (pe.token_first_reuse < 0) {
+                            pe.token_first_reuse = total_tokens;
+                        }
+                        pe.reuse_count++;
+                    }
+                }
                 continue;
             }
 
-            n_misses++;
-            if (ls.in_flight[e]) {
+            // miss
+            if (phase_prefill) n_misses_prefill++; else n_misses_decode++;
+            if (log_enabled && ls.last_promo_id[e] >= 0) {
+                std::lock_guard<std::mutex> lock(log_mu);
+                promo_event & pe = log[ls.last_promo_id[e]];
+                if (pe.token_commit < 0) {
+                    pe.demands_while_pending++;
+                } else if (pe.token_evict >= 0) {
+                    pe.re_misses_after_eviction++;
+                }
+            }
+
+            if (ls.in_flight[e] || !admission_ok || queued_candidate[e]) {
                 continue;
             }
+
+            bool eligible;
             if (force_churn) {
-                admit((int) il, e);
-                continue;
+                eligible = true;
+                ls.miss_streak[e]++;
+            } else {
+                const int32_t last = ls.last_miss_tick[e];
+                if (last < 0 || tick - last > ADMIT_WINDOW) {
+                    ls.miss_streak[e] = 1; // fresh streak: outside the window (or never missed before)
+                } else {
+                    ls.miss_streak[e]++;
+                }
+                eligible = ls.miss_streak[e] >= 2;
             }
-            const int32_t last = ls.last_miss_tick[e];
             ls.last_miss_tick[e] = tick;
-            if (last >= 0 && tick - last <= ADMIT_WINDOW) {
-                admit((int) il, e);
+
+            if (eligible) {
+                candidates.push_back(e);
+                queued_candidate[e] = true;
             }
         }
+
+        for (int32_t e : candidates) {
+            admit((int) il, e, phase_prefill, force_churn ? "force-churn" : "second-miss");
+        }
+
         ls.pending_routing.clear();
     }
+
+    if (!phase_prefill) {
+        n_decode_tokens += pending_n_tokens;
+    }
+    pending_n_tokens = 0;
 }
 
-void llama_moe_residency::collect_routing(const llm_graph_result * res) {
+void llama_moe_residency::collect_routing(const llm_graph_result * res, uint32_t n_tokens) {
+    pending_n_tokens = n_tokens;
     for (size_t il = 0; il < layers_.size(); ++il) {
         layer_state & ls = layers_[il];
         if (ls.n_slots == 0) {
@@ -306,8 +483,16 @@ void llama_moe_residency::collect_routing(const llm_graph_result * res) {
 }
 
 void llama_moe_residency::log_counters() const {
-    LLAMA_LOG_INFO("%s: moe dynamic residency: hits %lld, misses %lld, promotions %lld, useful promotions %lld, "
-            "bytes copied %lld\n", __func__,
-            (long long) n_hits, (long long) n_misses, (long long) n_promotions,
-            (long long) n_useful_promotions, (long long) n_bytes_copied);
+    const uint64_t n_hits    = n_hits_prefill + n_hits_decode;
+    const uint64_t n_misses  = n_misses_prefill + n_misses_decode;
+    const double useful_pct  = n_promotions ? 100.0 * (double) n_useful_promotions / (double) n_promotions : 0.0;
+    const double bytes_per_decode_token = n_decode_tokens ? (double) n_bytes_copied / (double) n_decode_tokens : 0.0;
+
+    LLAMA_LOG_INFO("%s: moe dynamic residency: hits %lld (prefill %lld, decode %lld), misses %lld (prefill %lld, "
+            "decode %lld), promotions %lld, useful promotions %lld (%.1f%%), bytes copied %lld, decode tokens %lld, "
+            "bytes/decode token %.0f\n", __func__,
+            (long long) n_hits, (long long) n_hits_prefill, (long long) n_hits_decode,
+            (long long) n_misses, (long long) n_misses_prefill, (long long) n_misses_decode,
+            (long long) n_promotions, (long long) n_useful_promotions, useful_pct,
+            (long long) n_bytes_copied, (long long) n_decode_tokens, bytes_per_decode_token);
 }

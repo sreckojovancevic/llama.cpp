@@ -355,6 +355,20 @@ extern "C" {
         ggml_backend_dev_t * moe_devices;
         const int32_t *      moe_hot_dev;
 
+        // [EXPERIMENTAL, Phase 2a] with moe_dynamic: ubatches with more tokens than this get no admission
+        // (miss/hit counters are still updated, split by phase); 0 (default) disables this gate, reproducing the
+        // base moe_dynamic behavior. moe_dynamic_decode_window below suggests 32 (--n-cpu-moe / op offload batch)
+        int32_t moe_dynamic_batch_threshold;
+
+        // [EXPERIMENTAL, Phase 2a] with moe_dynamic: cap bytes admitted for promotion at one ubatch boundary to
+        // this many MB/s times the wall-clock time since the previous boundary that was eligible to admit; 0.0
+        // (default) disables the cap, reproducing the base moe_dynamic behavior
+        float moe_dynamic_bw_mbs;
+
+        // env LLAMA_MOE_DYNAMIC_LOG=<path.csv>: opt-in, one row per promotion (admission, transfer, commit, reuse,
+        // eviction); see tools/expert-trace/promo-report.py for the column meanings and a non-useful-promotion
+        // classifier. No model_params flag - controlled only by the env var, like LLAMA_MOE_DYNAMIC_FORCE_CHURN.
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -370,6 +384,12 @@ extern "C" {
         // updated at ubatch boundaries by second-miss admission and LRU eviction. Off by default: with it false, behavior
         // is exactly the static moe_placement. Requires moe_placement, a single hot device (no moe_devices) and mmap.
         bool moe_dynamic;
+
+        // [EXPERIMENTAL, Phase 2a] with moe_dynamic: count the admission window (second miss) in actual ubatch
+        // tokens instead of one tick per ubatch regardless of size (which lets a single large prefill ubatch look
+        // like "a second miss within the window" for almost every expert it touches). Off by default, reproducing
+        // the base moe_dynamic behavior.
+        bool moe_dynamic_decode_window;
     };
 
     struct llama_sampler_seq_config {

@@ -755,6 +755,11 @@ struct llama_model {
     bool moe_dynamic() const;
     // the warm-start hot set of layer il, local slot order (see llama_moe_placement::initial_hot); moe_dynamic() only
     const std::vector<int32_t> & moe_dynamic_initial_hot(int il) const;
+    // see llama_model_params::moe_dynamic_batch_threshold / moe_dynamic_bw_mbs / moe_dynamic_decode_window;
+    // 0 / 0.0 / false mean disabled (reproduces the base moe_dynamic behavior)
+    int32_t moe_dynamic_batch_threshold() const;
+    float   moe_dynamic_bw_mbs() const;
+    bool    moe_dynamic_decode_window() const;
 
     size_t n_devices() const;
     const float * tensor_split() const;
