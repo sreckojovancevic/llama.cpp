@@ -11,7 +11,7 @@
 #include <vector>
 
 struct llama_model;
-struct llm_graph_result;
+class llm_graph_result;
 
 // Phase 2a: dynamic MoE expert residency on top of the static hot/cold placement (llama_moe_placement).
 //
