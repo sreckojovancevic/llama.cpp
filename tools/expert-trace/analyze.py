@@ -9,6 +9,8 @@ Sections:
   5. dynamic cache simulation (per-layer LRU / LFU with K slots)
   6. throughput upper bound for the cold tier
   7. decode tokens/s estimate: LRU experts in VRAM vs all experts on CPU
+  8. realistic Phase 2a cache simulation: warm start from the ranking hot set, pinned slot 0,
+     one-token commit delay, second-miss admission, per-token PCIe byte budget
 
 A and B can each be a comma-separated list of traces; the traces of one group are concatenated.
 With one group, each trace is split: first halves of tokens go to A, second halves to B.
@@ -201,6 +203,117 @@ def simulate_cache(streams, k, policy, eb):
     return hits, acc, mb_all, mb_dec
 
 
+def access_stream_tokens(m, t):
+    """Ordered by token, then layer: list of (token, is_decode, [(layer_idx, experts), ...])."""
+    order = np.lexsort((t.rank, t.layer, t.token))
+    tok, lay, exp, dec = t.token[order], t.layer[order], t.expert[order], t.decode_mask[order]
+    out = []
+    n = len(order)
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and tok[j] == tok[i]:
+            j += 1
+        per_layer = []
+        k = i
+        while k < j:
+            e_end = k + 1
+            while e_end < j and lay[e_end] == lay[k]:
+                e_end += 1
+            per_layer.append((m.lidx[int(lay[k])], exp[k:e_end].tolist()))
+            k = e_end
+        out.append((int(tok[i]), bool(dec[i]), per_layer))
+        i = j
+    return out
+
+
+def realistic_warm_start(m, placed, cA):
+    """Per-layer OrderedDict of resident experts, in score order; slot 0 (first) is the pinned expert."""
+    cache, pin = [], []
+    for li in range(len(m.layers)):
+        exps = np.where(placed[li])[0]
+        if len(exps) == 0:
+            cache.append(OrderedDict())
+            pin.append(None)
+            continue
+        exps = exps[np.argsort(-cA[li, exps], kind="stable")]
+        cache.append(OrderedDict((int(e), True) for e in exps))
+        pin.append(int(exps[0]))
+    return cache, pin
+
+
+def simulate_realistic(m, t, placed, cA, eb, byte_budget_per_token, admit_window):
+    """Realistic Phase 2a cache: warm start from the static ranking (placed), slot 0 pinned per
+    layer, promotions committed one token after admission, admission only on a 2nd miss within
+    admit_window tokens, and a shared per-token PCIe byte budget for promotions.
+    Returns (hits, accesses, bytes transferred, demand bytes if uncapped, useful promotions, wasted promotions)."""
+    nL = len(m.layers)
+    cache, pin = realistic_warm_start(m, placed, cA)
+    capacity = [len(c) for c in cache]
+    last_miss = [{} for _ in range(nL)]
+    pending = [{} for _ in range(nL)]  # expert -> commit token
+    active_promo = {}  # (layer, expert) -> used since last promoted, only while resident
+    promo_counts = [0, 0]  # [useful, wasted]
+
+    def evict_insert(li, e):
+        if capacity[li] <= 0:
+            return
+        cl = cache[li]
+        if len(cl) >= capacity[li]:
+            victim = next((k for k in cl if k != pin[li]), None)
+            if victim is None:
+                return
+            del cl[victim]
+            key = (li, victim)
+            if key in active_promo:
+                promo_counts[0 if active_promo.pop(key) else 1] += 1
+        cl[e] = True
+
+    hits = accesses = 0
+    bytes_transferred = bytes_demand = 0.0
+
+    for tok, _dec, per_layer in access_stream_tokens(m, t):
+        for li in range(nL):
+            due = [e for e, ct in pending[li].items() if ct <= tok]
+            for e in due:
+                del pending[li][e]
+                evict_insert(li, e)
+                active_promo[(li, e)] = False
+
+        budget = byte_budget_per_token
+        seen_cand, candidates = set(), []
+        for li, exps in per_layer:
+            for e in exps:
+                e = int(e)
+                accesses += 1
+                if e in cache[li]:
+                    hits += 1
+                    if e != pin[li]:
+                        cache[li].move_to_end(e)
+                    if (li, e) in active_promo:
+                        active_promo[(li, e)] = True
+                    continue
+                bytes_demand += eb[li]
+                lm = last_miss[li].get(e)
+                key = (li, e)
+                if e not in pending[li] and lm is not None and tok - lm <= admit_window and key not in seen_cand:
+                    seen_cand.add(key)
+                    candidates.append(key)
+                last_miss[li][e] = tok
+
+        for li, e in candidates:
+            if capacity[li] <= 0 or budget < eb[li]:
+                continue
+            budget -= eb[li]
+            bytes_transferred += eb[li]
+            pending[li][e] = tok + 1
+
+    for used in active_promo.values():
+        promo_counts[0 if used else 1] += 1
+    useful, wasted = promo_counts
+    return hits, accesses, bytes_transferred, bytes_demand, useful, wasted
+
+
 def greedy_placement(m, counts_a, budget):
     """Pick (layer, expert) by count/bytes until budget is used. Returns bool mask [n_layer, n_expert] and bytes used.
     Experts not seen in the profile fill the rest of the budget, spread over layers in turn."""
@@ -231,7 +344,9 @@ def main():
     ap.add_argument("--vram-budget", default=None, help="VRAM budget for expert weights, e.g. 8G, 512M, or bytes (default: 50%% of all expert bytes)")
     ap.add_argument("--cache-slots", default=None, help="comma-separated K values for LRU/LFU (default: n_used, 2*n_used, n_expert/4, n_expert/2)")
     ap.add_argument("--bandwidth", default=None, help="comma-separated extra cold-tier bandwidths in MB/s (presets always shown: nvme 3000, sata-ssd 500, hdd 150)")
-    ap.add_argument("--pcie-bw", type=float, default=12000.0, help="host to VRAM copy bandwidth in MB/s for section 7 (default: %(default)g)")
+    ap.add_argument("--pcie-bw", type=float, default=12000.0, help="host to VRAM copy bandwidth in MB/s for sections 7 and 8 (default: %(default)g)")
+    ap.add_argument("--admit-window", type=int, default=8, help="tokens window for 2nd-miss admission in the realistic cache sim, section 8 (default: %(default)s)")
+    ap.add_argument("--token-time-ms", type=float, default=20.0, help="assumed decode token time in ms, sets the per-token PCIe byte budget in section 8 (--pcie-bw * token time) (default: %(default)g)")
     ap.add_argument("--cpu-expert-gbs", type=float, default=40.0, help="effective CPU memory bandwidth for expert compute in GB/s (default: %(default)g)")
     ap.add_argument("--gpu-expert-gbs", type=float, default=400.0, help="effective GPU memory bandwidth for expert compute in GB/s (default: %(default)g)")
     ap.add_argument("--no-plots", action="store_true", help="do not write PNG plots")
@@ -556,6 +671,20 @@ def main():
         ax.set_title("LRU experts in VRAM")
         ax.legend()
         save(fig, "7_decode_estimate.png")
+
+    # 8. realistic Phase 2a cache simulation
+    byte_budget = args.pcie_bw * 1e6 * (args.token_time_ms / 1000.0)
+    print("\n== 8. Realistic Phase 2a cache simulation on B ==")
+    print(f"inputs: warm-start budget {fmt_bytes(budget)} (section 4 ranking), admit window {args.admit_window} tokens, "
+          f"per-token PCIe budget {fmt_bytes(byte_budget)} ({args.pcie_bw:g} MB/s * {args.token_time_ms:g} ms)")
+    print("model: warm start = section 4 ranking hot set; slot 0 per layer is pinned to its hottest expert (never evicted);")
+    print("       a miss is promoted only on its 2nd occurrence within the admit window, gated by the per-token PCIe budget;")
+    print("       a promoted expert becomes resident one token after admission (commit delay); eviction is LRU otherwise")
+    r_hits, r_acc, r_bytes, r_demand, r_useful, r_wasted = simulate_realistic(m, B, placed, cA, m.expert_bytes, byte_budget, args.admit_window)
+    n_promo = r_useful + r_wasted
+    print(f"hit rate: {100.0 * r_hits / max(r_acc, 1):.2f}%   (static ranking, section 4: {100.0 * hitB:.2f}%)")
+    print(f"bytes/token transferred (budget-capped promotions): {fmt_bytes(r_bytes / n_tok_B)}   demand if uncapped: {fmt_bytes(r_demand / n_tok_B)}")
+    print(f"promotions: {n_promo}, useful (hit again before eviction/end of trace): {r_useful} ({100.0 * r_useful / max(n_promo, 1):.1f}%), wasted: {r_wasted}")
 
 
 if __name__ == "__main__":
