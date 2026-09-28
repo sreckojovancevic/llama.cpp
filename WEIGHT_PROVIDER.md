@@ -726,3 +726,145 @@ collect_routing() calls), `include/llama.h` + `common/` (the flag and its plumbi
 
 Not started: Phase 2b (predictor/intra-token prefetch) and the GPU/CPU overlap work,
 per the instruction to keep this milestone to Phase 2a only.
+
+## Task 9 - Phase 2a CUDA measurement, hit-rate bug, admission diagnostics (2026-09-28)
+
+First CUDA numbers (RTX 2060 Super, `heldout_code.txt`, 2077-token prompt + 128 decode):
+
+| | static ranking | --moe-dynamic |
+|---|---|---|
+| pp t/s | 208 | 149-161 |
+| tg t/s | 27.5 | 22.0-24.9 |
+| counters | - | hits 73353, misses 756759, promotions 10157, useful 3723, bytes 28989554688 |
+
+Slower than static, and the hit counter (8.8%) did not match the ~66% static hit rate
+measured on the same text (WEIGHT_PROVIDER.md "Phase 2a decision data").
+
+### Root cause of the hit-rate bug
+
+`boundary()` processed one ubatch's routing as a single pass, in order: for each
+selected expert, classify hit/miss against `expert_slot`, *then* immediately decide
+admission and evict if admitted, which flips `expert_slot` for the victim right away.
+The 2077-token prompt is one large prefill ubatch (default `-ub` 2048/512), so all of
+its routing is processed inside one `boundary()` call, at one tick. Two failure modes
+followed from that:
+
+1. **Every expert looked like "a second miss inside the window" immediately.** The
+   admission window (8 ticks) was counted in `boundary()` calls, not tokens; with an
+   entire 2077-token prefill inside one tick, any expert selected twice anywhere in the
+   prompt (nearly all of them, on a top-4/128 router) qualified for promotion right
+   away. That is the promotion storm (10157 promotions, ~29 GB, matching the report).
+2. **Hits got undercounted, badly.** Because eviction mutated `expert_slot` while the
+   same pass was still classifying later entries of the same ubatch, an expert that
+   was genuinely hot when the graph actually ran could be evicted by an earlier entry
+   in the routing list before its own (later) entry was checked - counted as a miss
+   even though the graph read it hot. On a 2077-token prompt with a small hot set this
+   happened constantly, which is why the counted hit rate (8.8%) was far below the
+   real one (~66%): most of the "misses" were bookkeeping artifacts, not real cache
+   misses at the time the graph ran.
+
+Both are `boundary()` bugs, not PCIe/RAM contention. Fixed by splitting `boundary()`
+into two passes per layer: pass 1 classifies every routed id as a hit or miss against
+a state that pass 1 itself never mutates (LRU-touching a hit is fine, it does not
+change hit/miss classification of other entries), collecting eligible misses into a
+deduplicated candidate list; pass 2 runs `admit()` (which does mutate `expert_slot`
+and the device tables) only for that list. This alone fixes the hit-count corruption
+regardless of ubatch size, and is not behind a flag - it is a bug fix, not a policy
+change.
+
+### Admission policy switches (each off by default, reproduces the base moe_dynamic behavior)
+
+- `--moe-dynamic-batch-threshold N`: no admission from ubatches with more than N
+  tokens (their hits/misses are still counted). Suggested: 32, the `--n-cpu-moe` / op
+  offload batch size.
+- `--moe-dynamic-decode-window`: count the admission window in actual ubatch tokens
+  (`tick += ubatch.n_tokens`) instead of one tick per ubatch regardless of size. Fixes
+  failure mode 1 directly; independent of the threshold switch (e.g. useful together
+  with a *raised* threshold that still allows admission from moderate-sized batches,
+  windowed correctly).
+- `--moe-dynamic-bw MB/s`: cap bytes admitted for promotion at one boundary to this
+  many MB/s times the wall-clock time since the previous boundary that was eligible to
+  admit (a real per-step rate limit, not just a window/threshold heuristic).
+
+Hit/miss counters are now always split prefill/decode (`ubatch.n_tokens > 1` = prefill;
+this classification does not depend on the switches above), and there are now separate
+decode-only derived numbers: bytes copied per decode token, and useful-promotion %.
+
+### Per-promotion event log and classifier (env `LLAMA_MOE_DYNAMIC_LOG=<path.csv>`, opt-in)
+
+Added before changing the default admission policy, so the current (unfixed-policy,
+bug-fixed-counters) behavior can be diagnosed directly rather than guessed at. One row
+per promotion, written by `llama_moe_residency::write_promo_log()` at destruction; see
+the field comments on `llama_moe_residency::promo_event` in
+`src/llama-moe-residency.h` for exactly what each column means and when it is set
+(admission, transfer start/end, commit, first reuse and reuse count, eviction, and -
+after eviction - whether it was missed again).
+
+`tools/expert-trace/promo-report.py` reads the CSV and reports, split prefill/decode:
+hit/reuse/eviction summary stats; the reuse-count distribution (0, 1, 2, 3, 4-7, 8+);
+a net-benefit estimate per promotion (`reuse_count * --saved-ms-per-reuse -
+bytes / (--transfer-mbs * 1000)`, both given as arguments, defaults 0.065 ms and 12000
+MB/s) and how many promotions were net positive; and a classification of every
+non-useful promotion (reuse_count == 0) into one of six likely causes (threshold too
+low, evicted too early, transfer too late, no longer needed, queue delay, slot
+pressure) - see the script's docstring for the exact rule per class and the priority
+order between them.
+
+### Verification (CPU, RPC device as the hot device)
+
+- `test-backend-ops -b CPU -o MUL_MAT_ID`: 930/930 (unaffected by this task, re-run for
+  the record).
+- `regress-placement.py --dynamic`, extended: the `dyn` run (all switches off,
+  reproducing the base/current policy) and a new `dyn_sw` run
+  (`--moe-dynamic-batch-threshold 32 --moe-dynamic-decode-window --moe-dynamic-bw
+  12000`, i.e. all three switches on together) are both exact (max abs diff 0) against
+  the unsplit model at `-ub 1`, with `LLAMA_MOE_DYNAMIC_FORCE_CHURN=1` and both runs'
+  counters checked for promotions > 0 and useful promotions > 0. At 4 layers: `dyn` 432
+  promotions/140 useful, `dyn_sw` 421/133. At 48 layers: `dyn` 6425/2975, `dyn_sw`
+  6361/2903. The switches change *how many* promotions are admitted and when, never
+  correctness of a promotion once admitted, so exactness holding with them on is the
+  expected result, not evidence either way about their effect on the hit rate (that
+  needs the owner's GPU, see below).
+- `promo-report.py` smoke-tested against two logs: a 3-row log from a single-shot
+  `-ub 512` `llama-debug` run (only a warmup ubatch's promotions ever reach a
+  `boundary()` call in that single-decode tool, so it cannot commit anything from the
+  real prompt - not a representative dataset, but exercises the parser/classifier on
+  real "admitted, never committed" rows) and a 441-row log from the same `-ub 1`
+  `LLAMA_MOE_DYNAMIC_FORCE_CHURN=1` setup used for the exactness checks above (32.0%
+  useful, reuse-count distribution 0:300/1:141, net benefit +5.0 ms, 96% of non-useful
+  promotions classified `F` slot pressure - expected, this tiny test model has only
+  2-3 hot slots per layer under forced immediate admission). Both ran without error and
+  produced numbers consistent with the underlying counters.
+- Did not verify the *decode-token accuracy* of `--moe-dynamic-batch-threshold` /
+  `--moe-dynamic-decode-window` against a real prefill-then-decode sequence in this
+  sandbox: `llama-debug` (used for the exact-logit checks) makes exactly one
+  `llama_decode()` call, so a `boundary()` call only ever exists to apply *previously*
+  queued promotions, never to admit-and-commit from the same run's own prefill - a
+  structural property of that tool, not of the fix. `llama-cli`'s real generation loop
+  needs a VRAM-budget probe of its own (its context defaults differ enough from
+  `llama-debug`'s that the probed margin above did not carry over) that there was not
+  time to add here; manually confirmed instead, with a single-shot `-ub 512` run
+  against the same model, that the promotion log correctly labels admissions
+  `phase=prefill` when a genuine multi-token ubatch triggers them (see the 3-row log
+  above). The owner's CUDA run is real prefill-then-decode and is the real test of the
+  threshold/window switches' effect on the hit rate; see below.
+
+### Still needs the owner's GPU
+
+- Re-run the CUDA measurement above (static ranking vs `--moe-dynamic`) with the fixed
+  hit-rate counters alone (all switches still off) to get an accurate baseline hit rate
+  first, then with `--moe-dynamic-batch-threshold 32 --moe-dynamic-decode-window`
+  (fixes both prefill-storm failure modes) and separately with `--moe-dynamic-bw 12000`
+  added, to see which switch combination, if any, recovers the static ranking's
+  decode t/s while keeping the out-of-domain adaptivity Phase 2a is for.
+- `LLAMA_MOE_DYNAMIC_LOG` + `promo-report.py` on that same real run: the class
+  breakdown (A-F) should say directly whether the remaining non-useful promotions (if
+  any, once the switches are on) are mostly prefill artifacts (class A, should drop to
+  ~0 with the threshold switch), genuinely evicted too early (class B, LRU may need
+  frequency or a longer window), or slot pressure from too few hot slots for the
+  working set (class F, a budget question, not a policy one).
+- Net benefit at real (not force-churn) timings: rerun `promo-report.py` with
+  `--saved-ms-per-reuse` set from the actual measured CPU-vs-hot per-expert time
+  difference on that machine, not the current placeholder default.
+- Everything already listed as needing the GPU in Task 8 above (CUDA exactness/KLD,
+  WDDM overlap, RAM-bandwidth contention) still applies unchanged.
