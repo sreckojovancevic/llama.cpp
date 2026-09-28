@@ -674,17 +674,19 @@ def main():
 
     # 8. realistic Phase 2a cache simulation
     byte_budget = args.pcie_bw * 1e6 * (args.token_time_ms / 1000.0)
-    print("\n== 8. Realistic Phase 2a cache simulation on B ==")
+    print("\n== 8. Realistic Phase 2a cache simulation (in domain: A, out of domain: B) ==")
     print(f"inputs: warm-start budget {fmt_bytes(budget)} (section 4 ranking), admit window {args.admit_window} tokens, "
           f"per-token PCIe budget {fmt_bytes(byte_budget)} ({args.pcie_bw:g} MB/s * {args.token_time_ms:g} ms)")
     print("model: warm start = section 4 ranking hot set; slot 0 per layer is pinned to its hottest expert (never evicted);")
     print("       a miss is promoted only on its 2nd occurrence within the admit window, gated by the per-token PCIe budget;")
     print("       a promoted expert becomes resident one token after admission (commit delay); eviction is LRU otherwise")
-    r_hits, r_acc, r_bytes, r_demand, r_useful, r_wasted = simulate_realistic(m, B, placed, cA, m.expert_bytes, byte_budget, args.admit_window)
-    n_promo = r_useful + r_wasted
-    print(f"hit rate: {100.0 * r_hits / max(r_acc, 1):.2f}%   (static ranking, section 4: {100.0 * hitB:.2f}%)")
-    print(f"bytes/token transferred (budget-capped promotions): {fmt_bytes(r_bytes / n_tok_B)}   demand if uncapped: {fmt_bytes(r_demand / n_tok_B)}")
-    print(f"promotions: {n_promo}, useful (hit again before eviction/end of trace): {r_useful} ({100.0 * r_useful / max(n_promo, 1):.1f}%), wasted: {r_wasted}")
+    n_tok_A = max(len(A.tokens), 1)
+    print(f"{'trace':<18} {'hit %':>7} {'static %':>9} {'bytes/token':>12} {'demand/token':>13} {'promotions':>11} {'useful %':>9}")
+    for name, trace, n_tok, static_hit in (("A (in domain)", A, n_tok_A, selfA), ("B (out of domain)", B, n_tok_B, hitB)):
+        r_hits, r_acc, r_bytes, r_demand, r_useful, r_wasted = simulate_realistic(m, trace, placed, cA, m.expert_bytes, byte_budget, args.admit_window)
+        n_promo = r_useful + r_wasted
+        print(f"{name:<18} {100.0 * r_hits / max(r_acc, 1):>7.2f} {100.0 * static_hit:>9.2f} {fmt_bytes(r_bytes / n_tok):>12} {fmt_bytes(r_demand / n_tok):>13} {n_promo:>11} {100.0 * r_useful / max(n_promo, 1):>9.1f}")
+    print("static % = section 4 static-ranking hit rate on the same trace (no promotion); useful % = promotions hit again before eviction or end of trace")
 
 
 if __name__ == "__main__":
