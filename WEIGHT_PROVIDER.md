@@ -551,3 +551,38 @@ CPU about 38 ms, GPU about 17 ms.
 3. Next lever: overlap the GPU hot bucket and the CPU cold bucket within a layer
    (token time towards max(GPU, CPU) instead of the sum). This helps every domain.
    Phase 2 (dynamic residency) comes after that, depending on the remaining CPU time.
+
+## Phase 2a decision data and a Windows note (2026-09-28)
+
+### Real hit rates on held-out text (profile: tr_sr_pravni + trace_sr + trace_code, ranking budget 4.6 GiB)
+
+| held-out text | static ranking | ideal LRU K=32 | realistic Phase 2a sim (section 8) | bytes/token | useful promotions |
+|---|---|---|---|---|---|
+| Serbian legal | 72.5% | 89.3% | 90.7% | 29 MiB | 77% |
+| code | 66.3% (decode 63.9%) | 83.2% | 85.7% | 44 MiB | 74% |
+
+Section 8 settings: warm start from the ranking, slot 0 pinned, second-miss admission
+within 8 tokens, one-token commit delay, PCIe budget 12000 MB/s * 35 ms per token.
+Both texts gain about 18-19 points over static placement, well above the 10-point gate
+in PHASE2_REVIEW.md. Caveat: the simulation feeds prefill tokens one at a time.
+Decision: implement Phase 2a.
+
+### Windows run-to-run note
+
+Same machine, same binaries, held-out Serbian legal text, decode t/s:
+
+| run | --n-cpu-moe 40 | ranking |
+|---|---|---|
+| morning, HAGS off | 20.3 | 29.3 |
+| after a reboot, HAGS off, warm file cache | 19.1 | 22.6 |
+| after another reboot, HAGS on, warm file cache | 21.8 | 30.1 |
+
+In the slow boot the GGML_SCHED_TIMING=2 profile showed the same per-layer kernel times
+as the good runs, but the untimed run was no faster than the timed one, i.e. the
+asynchronous GPU/CPU pipelining was lost. Cause unknown (not budget: 1720 hot experts in
+all runs; not GPU clocks: no throttle reasons; power plan high performance).
+HAGS is not proven to matter. Practical rules for measuring on Windows:
+- after a reboot, warm the model file first (cmd /c "type <model.gguf> > nul");
+- run each configuration at least twice and compare configurations within one boot;
+- the ranking placement is more sensitive to this than --n-cpu-moe, because it has a
+  CPU<->GPU split in every layer.
