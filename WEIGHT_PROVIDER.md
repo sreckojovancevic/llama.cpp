@@ -491,3 +491,63 @@ Since Task 6 the cold bucket has to be in a host buffer with the plain layout (f
 - Small, focused commits with clear messages.
 - At the end of each session, write a short summary: what was done, what was
   verified and how, what was NOT verified, open questions.
+
+## Measured results - RTX 2060 Super 8 GB (2026-09-28)
+
+Machine: RTX 2060 Super 8 GB (Turing, sm_75), 32 GB DDR4, Windows, MSVC + CUDA build.
+Model: Qwen3-30B-A3B Q4_K_M (48 MoE layers, 128 experts, top-8). n_ctx 4096.
+Conditions: clean run (RAG/Docker stopped), about 22 GB RAM free at start.
+Full log: results/moe-20260928-015047/summary.md (not committed).
+
+### Correctness
+
+- all-cold placement vs --cpu-moe: exact (max abs diff 0) at ubatch 512 and 1.
+- KLD vs --cpu-moe on wikitext-2 (40 chunks): 0.000000 for p3g, p5g and ranking,
+  the same as --n-cpu-moe 40 (prefill offloads the cold bucket like the baseline).
+- Kernel noise decomposition (ubatch 16, nothing offloaded):
+  CPU vs GPU kernels 0.0094, repack vs plain 0.0086. The earlier 0.009 KLD of the
+  placements was kernel noise, not a placement bug.
+- At ubatch 1 one prompt flipped top-1 (max abs diff about 1.3), consistent with the
+  kernel noise above on a near-tied token.
+
+### Prefill (llama-batched-bench pp512, random tokens, median of 3)
+
+| config | pp512 t/s |
+|---|---|
+| --n-cpu-moe 48 | 158 |
+| --n-cpu-moe 40 | 169 |
+| p3g | 162 |
+| p5g | 183 |
+| ranking (margin 1G) | 156 |
+
+No prefill regression after the Task 6 fix.
+
+### Decode on real text (llama-completion, 128 tokens, --temp 0)
+
+Profile: tr_sr_pravni.csv + trace_sr.csv + trace_code.csv.
+Both prompts are held out (not part of the profile traces).
+
+| prompt | --n-cpu-moe 40 | p3g | p5g | ranking |
+|---|---|---|---|---|
+| code (src/llama-sampler.cpp) | 16.9 | 24.9 (+47%) | 29.6 (+75%) | 28.7 (+70%) |
+| Serbian legal text, 1841 prompt tokens | 20.3 | - | 30.6 (+51%) | 29.3 (+45%) |
+
+Serbian legal text prompt eval: 231 (ncmoe40), 229 (p5g), 216 (ranking) t/s.
+Load time with placement (cold bucket in the file mapping): about 5-6 s.
+
+### Where decode time goes (GGML_SCHED_TIMING=2, ranking, code prompt)
+
+Per token: CPU cold experts about 20 ms, GPU about 15 ms. They run one after the
+other within each layer, so the token time is close to the sum. With --n-cpu-moe 40:
+CPU about 38 ms, GPU about 17 ms.
+
+### Conclusions
+
+1. Static per-expert placement gives +45-75% decode over --n-cpu-moe 40 on held-out
+   in-domain text, with the same VRAM, the same prefill speed and identical output
+   quality (KLD 0).
+2. Out of domain (the English README fallback in the first run) the static hot set
+   was worse than --n-cpu-moe 40. The profile must match the workload.
+3. Next lever: overlap the GPU hot bucket and the CPU cold bucket within a layer
+   (token time towards max(GPU, CPU) instead of the sum). This helps every domain.
+   Phase 2 (dynamic residency) comes after that, depending on the remaining CPU time.
